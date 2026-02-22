@@ -19,7 +19,7 @@
 - 日本語ドキュメントハブ：[README.ja.md](README.ja.md)
 - ロシア語ドキュメントハブ：[README.ru.md](README.ru.md)
 - フランス語ドキュメントハブ：[README.fr.md](README.fr.md)
-- ベトナム語ドキュメントハブ：[i18n/vi/README.md](i18n/vi/README.md)
+- ベトナム語ドキュメントハブ：[vi/README.md](vi/README.md)
 - 国際化ドキュメント索引：[i18n/README.md](i18n/README.md)
 - 国際化カバレッジマップ：[i18n-coverage.md](i18n-coverage.md)
 

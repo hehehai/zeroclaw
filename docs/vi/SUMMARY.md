@@ -6,7 +6,7 @@
 
 ## Điểm vào
 
-- README tiếng Việt: [../../../README.vi.md](../../../README.vi.md)
+- README tiếng Việt: [../../README.vi.md](../../README.vi.md)
 - Docs hub tiếng Việt: [README.md](README.md)
 
 ## Danh mục
@@ -61,7 +61,7 @@
 ### 6) Đóng góp & CI
 
 - [contributing/README.md](contributing/README.md)
-- [CONTRIBUTING.md](../../../CONTRIBUTING.md)
+- [CONTRIBUTING.md](../../CONTRIBUTING.md)
 - [pr-workflow.md](pr-workflow.md)
 - [reviewer-playbook.md](reviewer-playbook.md)
 - [ci-map.md](ci-map.md)
@@ -74,4 +74,4 @@
 
 ## Ngôn ngữ khác
 
-- English TOC: [../../SUMMARY.md](../../SUMMARY.md)
+- English TOC: [../SUMMARY.md](../SUMMARY.md)

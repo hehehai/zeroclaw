@@ -19,7 +19,7 @@ Dernière mise à jour : **18 février 2026**.
 - Documentation en japonais : [README.ja.md](README.ja.md)
 - Documentation en russe : [README.ru.md](README.ru.md)
 - Documentation en français : [README.fr.md](README.fr.md)
-- Documentation en vietnamien : [i18n/vi/README.md](i18n/vi/README.md)
+- Documentation en vietnamien : [vi/README.md](vi/README.md)
 - Index de localisation : [i18n/README.md](i18n/README.md)
 - Carte de couverture i18n : [i18n-coverage.md](i18n-coverage.md)
 

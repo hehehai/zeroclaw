@@ -32,7 +32,7 @@
 <p align="center">
   <a href="#quick-start">Bắt đầu</a> |
   <a href="bootstrap.sh">Cài đặt một lần bấm</a> |
-  <a href="docs/i18n/vi/README.md">Trung tâm tài liệu</a> |
+  <a href="docs/vi/README.md">Trung tâm tài liệu</a> |
   <a href="docs/SUMMARY.md">Mục lục tài liệu</a>
 </p>
 
@@ -40,7 +40,7 @@
   <strong>Truy cập nhanh:</strong>
   <a href="docs/reference/README.md">Tài liệu tham khảo</a> ·
   <a href="docs/operations/README.md">Vận hành</a> ·
-  <a href="docs/i18n/vi/troubleshooting.md">Khắc phục sự cố</a> ·
+  <a href="docs/vi/troubleshooting.md">Khắc phục sự cố</a> ·
   <a href="docs/security/README.md">Bảo mật</a> ·
   <a href="docs/hardware/README.md">Phần cứng</a> ·
   <a href="docs/contributing/README.md">Đóng góp</a>
@@ -953,20 +953,20 @@ git push --no-verify
 
 Bắt đầu từ trung tâm tài liệu để có bản đồ theo tác vụ:
 
-- Trung tâm tài liệu: [`docs/i18n/vi/README.md`](docs/i18n/vi/README.md)
+- Trung tâm tài liệu: [`docs/vi/README.md`](docs/vi/README.md)
 - Mục lục tài liệu thống nhất: [`docs/SUMMARY.md`](docs/SUMMARY.md)
-- Tài liệu tham khảo lệnh: [`docs/i18n/vi/commands-reference.md`](docs/i18n/vi/commands-reference.md)
-- Tài liệu tham khảo cấu hình: [`docs/i18n/vi/config-reference.md`](docs/i18n/vi/config-reference.md)
+- Tài liệu tham khảo lệnh: [`docs/vi/commands-reference.md`](docs/vi/commands-reference.md)
+- Tài liệu tham khảo cấu hình: [`docs/vi/config-reference.md`](docs/vi/config-reference.md)
 - Tài liệu tham khảo provider: [`docs/providers-reference.md`](docs/providers-reference.md)
 - Tài liệu tham khảo channel: [`docs/channels-reference.md`](docs/channels-reference.md)
 - Sổ tay vận hành: [`docs/operations-runbook.md`](docs/operations-runbook.md)
-- Khắc phục sự cố: [`docs/i18n/vi/troubleshooting.md`](docs/i18n/vi/troubleshooting.md)
+- Khắc phục sự cố: [`docs/vi/troubleshooting.md`](docs/vi/troubleshooting.md)
 - Kiểm kê/phân loại tài liệu: [`docs/docs-inventory.md`](docs/docs-inventory.md)
 - Tổng hợp phân loại PR/Issue (tính đến 18/2/2026): [`docs/project-triage-snapshot-2026-02-18.md`](docs/project-triage-snapshot-2026-02-18.md)
 
 Tài liệu tham khảo cộng tác cốt lõi:
 
-- Trung tâm tài liệu: [docs/i18n/vi/README.md](docs/i18n/vi/README.md)
+- Trung tâm tài liệu: [docs/vi/README.md](docs/vi/README.md)
 - Template tài liệu: [docs/doc-template.md](docs/doc-template.md)
 - Danh sách kiểm tra thay đổi tài liệu: [docs/README.md#4-documentation-change-checklist](docs/README.md#4-documentation-change-checklist)
 - Tài liệu tham khảo cấu hình channel: [docs/channels-reference.md](docs/channels-reference.md)

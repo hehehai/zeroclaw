@@ -19,7 +19,7 @@
 - Документация на японском: [README.ja.md](README.ja.md)
 - Документация на русском: [README.ru.md](README.ru.md)
 - Документация на французском: [README.fr.md](README.fr.md)
-- Документация на вьетнамском: [i18n/vi/README.md](i18n/vi/README.md)
+- Документация на вьетнамском: [vi/README.md](vi/README.md)
 - Индекс локализации: [i18n/README.md](i18n/README.md)
 - Карта покрытия локализации: [i18n-coverage.md](i18n-coverage.md)
 

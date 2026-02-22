@@ -149,6 +149,9 @@ enum ChannelRuntimeCommand {
     SetProvider(String),
     ShowModel,
     SetModel(String),
+    ShowSkills,
+    RunSkill { name: String, input: String },
+    ResetSession,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -489,6 +492,13 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::SetModel(model))
             }
         }
+        "/skills" => Some(ChannelRuntimeCommand::ShowSkills),
+        "/skill" => {
+            let name = parts.next().unwrap_or_default().trim().to_string();
+            let input = parts.collect::<Vec<_>>().join(" ").trim().to_string();
+            Some(ChannelRuntimeCommand::RunSkill { name, input })
+        }
+        "/new" | "/clear" => Some(ChannelRuntimeCommand::ResetSession),
         _ => None,
     }
 }
@@ -916,6 +926,7 @@ fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &P
         current.provider, current.model
     );
     response.push_str("\nSwitch model with `/model <model-id>`.\n");
+    response.push_str("Reset sender session with `/new`.\n");
 
     let cached_models = load_cached_model_preview(workspace_dir, &current.provider);
     if cached_models.is_empty() {
@@ -947,6 +958,7 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
     );
     response.push_str("\nSwitch provider with `/models <provider>`.\n");
     response.push_str("Switch model with `/model <model-id>`.\n\n");
+    response.push_str("Reset sender session with `/new`.\n\n");
     response.push_str("Available providers:\n");
     for provider in providers::list_providers() {
         if provider.aliases.is_empty() {
@@ -963,9 +975,81 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
     response
 }
 
+fn load_runtime_skills(workspace_dir: &Path) -> Vec<crate::skills::Skill> {
+    let mut skills = crate::skills::load_skills(workspace_dir);
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills
+}
+
+fn build_skills_help_response(workspace_dir: &Path) -> String {
+    let skills = load_runtime_skills(workspace_dir);
+
+    if skills.is_empty() {
+        return "No skills are currently loaded.\nInstall one with `zeroclaw skills install <source>` and restart channel runtime.\nUse `/skill <name> [input]` once skills are available.".to_string();
+    }
+
+    let mut response = String::new();
+    response.push_str("Available skills:\n");
+    for skill in skills {
+        if skill.description.trim().is_empty() {
+            let _ = writeln!(response, "- `{}`", skill.name);
+        } else {
+            let _ = writeln!(
+                response,
+                "- `{}` — {}",
+                skill.name,
+                skill.description.trim()
+            );
+        }
+    }
+    response.push_str("\nRun a skill with `/skill <name> [input]`.");
+    response
+}
+
+fn resolve_skill_name(workspace_dir: &Path, raw_name: &str) -> Option<String> {
+    let candidate = raw_name.trim();
+    if candidate.is_empty() {
+        return None;
+    }
+
+    let skills = load_runtime_skills(workspace_dir);
+    for skill in &skills {
+        if skill.name.eq_ignore_ascii_case(candidate) {
+            return Some(skill.name.clone());
+        }
+    }
+    None
+}
+
+fn available_skill_names_csv(workspace_dir: &Path) -> String {
+    let names: Vec<String> = load_runtime_skills(workspace_dir)
+        .into_iter()
+        .map(|skill| skill.name)
+        .collect();
+
+    if names.is_empty() {
+        "<none>".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
+fn build_skill_execution_prompt(name: &str, input: &str) -> String {
+    let trimmed_input = input.trim();
+    if trimmed_input.is_empty() {
+        format!(
+            "User invoked `/skill {name}`.\nUse the `{name}` skill now. If additional details are required, ask one concise clarification question."
+        )
+    } else {
+        format!(
+            "User invoked `/skill {name}`.\nUse the `{name}` skill to complete this task:\n{trimmed_input}"
+        )
+    }
+}
+
 async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
-    msg: &traits::ChannelMessage,
+    msg: &mut traits::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
 ) -> bool {
     let Some(command) = parse_runtime_command(&msg.channel, &msg.content) else {
@@ -1025,6 +1109,32 @@ async fn handle_runtime_command_if_needed(
                     current.provider
                 )
             }
+        }
+        ChannelRuntimeCommand::ShowSkills => {
+            build_skills_help_response(ctx.workspace_dir.as_path())
+        }
+        ChannelRuntimeCommand::RunSkill { name, input } => {
+            if name.trim().is_empty() {
+                "Missing skill name.\nUsage: `/skill <name> [input]`\nUse `/skills` to list installed skills."
+                    .to_string()
+            } else if let Some(resolved_name) =
+                resolve_skill_name(ctx.workspace_dir.as_path(), &name)
+            {
+                msg.content = build_skill_execution_prompt(&resolved_name, &input);
+                return false;
+            } else {
+                let available = available_skill_names_csv(ctx.workspace_dir.as_path());
+                format!(
+                    "Unknown skill `{}`.\nAvailable skills: {}\nUse `/skills` for descriptions.",
+                    name.trim(),
+                    available
+                )
+            }
+        }
+        ChannelRuntimeCommand::ResetSession => {
+            clear_sender_history(ctx, &sender_key);
+            set_route_selection(ctx, &sender_key, default_route_selection(ctx));
+            "Started a new session for this sender. Previous context has been cleared.".to_string()
         }
     };
 
@@ -1504,7 +1614,7 @@ async fn process_channel_message(
     );
 
     // ── Hook: on_message_received (modifying) ────────────
-    let msg = if let Some(hooks) = &ctx.hooks {
+    let mut msg = if let Some(hooks) = &ctx.hooks {
         match hooks.run_on_message_received(msg).await {
             crate::hooks::HookResult::Cancel(reason) => {
                 tracing::info!(%reason, "incoming message dropped by hook");
@@ -1520,7 +1630,7 @@ async fn process_channel_message(
     if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
         tracing::warn!("Failed to apply runtime config update: {err}");
     }
-    if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+    if handle_runtime_command_if_needed(ctx.as_ref(), &mut msg, target_channel.as_ref()).await {
         return;
     }
 
@@ -4357,6 +4467,323 @@ BTC is currently around $65,000 based on latest tool output."#
 
         assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 0);
         assert_eq!(fallback_provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_skills_command_lists_loaded_skills() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let skill_dir = workspace
+            .path()
+            .join("skills")
+            .join("zeroclaw-agent-browser-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "# zeroclaw-agent-browser-skill\n\nBrowser automation helper.",
+        )
+        .unwrap();
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace.path().to_path_buf()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-skills-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/skills".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Available skills:"));
+        assert!(sent[0].contains("zeroclaw-agent-browser-skill"));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_skill_command_unknown_skill_does_not_call_llm() {
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace.path().to_path_buf()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-skill-unknown-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/skill not-installed do something".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Unknown skill `not-installed`"));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_skill_command_known_skill_routes_to_llm() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let skill_dir = workspace.path().join("skills").join("browser-flow");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "# browser-flow\n\nUse browser tools for deterministic web checks.",
+        )
+        .unwrap();
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace.path().to_path_buf()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-skill-known-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/skill browser-flow open https://example.com".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("ok"));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_new_command_resets_sender_session() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut histories = HashMap::new();
+        histories.insert(
+            "telegram_alice".to_string(),
+            vec![
+                ChatMessage::user("old question"),
+                ChatMessage::assistant("old answer"),
+            ],
+        );
+
+        let mut route_overrides = HashMap::new();
+        route_overrides.insert(
+            "telegram_alice".to_string(),
+            ChannelRouteSelection {
+                provider: "openrouter".to_string(),
+                model: "route-model".to_string(),
+            },
+        );
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+        provider_cache_seed.insert("openrouter".to_string(), Arc::clone(&provider));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(histories)),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(route_overrides)),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-new-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/new".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Started a new session"));
+
+        let route_key = "telegram_alice";
+        assert!(
+            runtime_ctx
+                .route_overrides
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(route_key)
+                .is_none(),
+            "route override should be cleared for /new"
+        );
+
+        assert!(
+            runtime_ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(route_key)
+                .is_none(),
+            "conversation history should be cleared for /new"
+        );
+
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

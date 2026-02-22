@@ -4,7 +4,7 @@ Cette page est le point d'entrée principal du système de documentation.
 
 Dernière mise à jour : **20 février 2026**.
 
-Hubs localisés : [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Русский](README.ru.md) · [Français](README.fr.md) · [Tiếng Việt](i18n/vi/README.md).
+Hubs localisés : [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Русский](README.ru.md) · [Français](README.fr.md) · [Tiếng Việt](vi/README.md).
 
 ## Commencez Ici
 
@@ -91,4 +91,4 @@ Hubs localisés : [简体中文](README.zh-CN.md) · [日本語](README.ja.md) �
 - 简体中文: [README.zh-CN.md](README.zh-CN.md)
 - 日本語: [README.ja.md](README.ja.md)
 - Русский: [README.ru.md](README.ru.md)
-- Tiếng Việt: [i18n/vi/README.md](i18n/vi/README.md)
+- Tiếng Việt: [vi/README.md](vi/README.md)

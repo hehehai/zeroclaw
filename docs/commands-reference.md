@@ -134,12 +134,25 @@ Notes:
 - `zeroclaw channel add <type> <json>`
 - `zeroclaw channel remove <name>`
 
+Operational note:
+
+- `zeroclaw channel start` runs in the foreground. Keep the process alive, or use `zeroclaw daemon` / `zeroclaw service install && zeroclaw service start` for persistent runtime.
+
 Runtime in-chat commands (Telegram/Discord while channel server is running):
 
 - `/models`
 - `/models <provider>`
 - `/model`
 - `/model <model-id>`
+- `/skills` — list loaded skills for current runtime
+- `/skill <name> [input]` — run a specific skill in current sender session
+- `/new` (or `/clear`) — reset sender session context
+
+Discord note:
+
+- ZeroClaw auto-registers slash commands `/new`, `/skills`, and `/skill` (guild scope when `channels_config.discord.guild_id` is set).
+- `/new` clears the current sender session history and starts a fresh context.
+- `/skill` requires a `name` option and accepts optional `input`; ZeroClaw forwards it into the current sender session workflow.
 
 Channel runtime also watches `config.toml` and hot-applies updates to:
 - `default_provider`

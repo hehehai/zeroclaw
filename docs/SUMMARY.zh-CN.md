@@ -19,7 +19,7 @@
 - 日文文档中心：[README.ja.md](README.ja.md)
 - 俄文文档中心：[README.ru.md](README.ru.md)
 - 法文文档中心：[README.fr.md](README.fr.md)
-- 越南文文档中心：[i18n/vi/README.md](i18n/vi/README.md)
+- 越南文文档中心：[vi/README.md](vi/README.md)
 - 国际化文档索引：[i18n/README.md](i18n/README.md)
 - 国际化覆盖图：[i18n-coverage.md](i18n-coverage.md)
 

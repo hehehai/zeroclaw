@@ -296,6 +296,9 @@ Notes:
 - When `backend = "computer_use"`, the agent delegates browser actions to the sidecar at `computer_use.endpoint`.
 - `allow_remote_endpoint = false` (default) rejects any non-loopback endpoint to prevent accidental public exposure.
 - Use `window_allowlist` to restrict which OS windows the sidecar can interact with.
+- For `backend = "agent_browser"`, install the CLI and browser runtime first:
+  - `npm install -g agent-browser`
+  - `agent-browser install`
 
 ## `[http_request]`
 

@@ -39,18 +39,21 @@ Each channel is enabled by creating its sub-table (for example, `[channels_confi
 
 ## In-Chat Runtime Model Switching (Telegram / Discord)
 
-When running `zeroclaw channel start` (or daemon mode), Telegram and Discord now support sender-scoped runtime switching:
+When running `zeroclaw channel start` (or daemon mode), Telegram and Discord support sender-scoped runtime commands:
 
 - `/models` — show available providers and current selection
 - `/models <provider>` — switch provider for the current sender session
 - `/model` — show current model and cached model IDs (if available)
 - `/model <model-id>` — switch model for the current sender session
+- `/skills` — list loaded runtime skills
+- `/skill <name> [input]` — run a specific skill in current sender session
 
 Notes:
 
 - Switching clears only that sender's in-memory conversation history to avoid cross-model context contamination.
 - Model cache previews come from `zeroclaw models refresh --provider <ID>`.
 - These are runtime chat commands, not CLI subcommands.
+- Discord slash auto-registration includes `/new`, `/skills`, and `/skill` when `channels_config.discord.guild_id` is configured.
 
 ## Inbound Image Marker Protocol
 

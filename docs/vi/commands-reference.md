@@ -86,12 +86,19 @@ Xác minh lần cuối: **2026-02-20**.
 - `zeroclaw channel add <type> <json>`
 - `zeroclaw channel remove <name>`
 
+Lưu ý vận hành:
+
+- `zeroclaw channel start` chạy foreground. Cần giữ tiến trình sống, hoặc dùng `zeroclaw daemon` / `zeroclaw service install && zeroclaw service start` để chạy bền vững.
+
 Lệnh trong chat khi runtime đang chạy (Telegram/Discord):
 
 - `/models`
 - `/models <provider>`
 - `/model`
 - `/model <model-id>`
+- `/skills` — liệt kê các skill đang được runtime nạp
+- `/skill <name> [input]` — chạy một skill cụ thể trong phiên người gửi hiện tại
+- `/new` (hoặc `/clear`) — reset session của người gửi
 
 Channel runtime cũng theo dõi `config.toml` và tự động áp dụng thay đổi cho:
 - `default_provider`
@@ -99,6 +106,12 @@ Channel runtime cũng theo dõi `config.toml` và tự động áp dụng thay �
 - `default_temperature`
 - `api_key` / `api_url` (cho provider mặc định)
 - `reliability.*` cài đặt retry của provider
+
+Ghi chú Discord:
+
+- `/new` sẽ xóa lịch sử session hiện tại của người gửi và bắt đầu ngữ cảnh mới.
+- ZeroClaw tự động đăng ký slash command `/new`, `/skills`, `/skill` (phạm vi guild khi đặt `channels_config.discord.guild_id`).
+- `/skill` yêu cầu option `name` và hỗ trợ option `input` (không bắt buộc); ZeroClaw sẽ chuyển thành workflow phiên hiện tại của người gửi.
 
 `add/remove` hiện chuyển hướng về thiết lập có hướng dẫn / cấu hình thủ công (chưa hỗ trợ đầy đủ mutator khai báo).
 

@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
@@ -50,6 +50,320 @@ impl DiscordChannel {
         // Discord bot tokens are base64(bot_user_id).timestamp.hmac
         let part = token.split('.').next()?;
         base64_decode(part)
+    }
+
+    async fn send_interaction_response(
+        &self,
+        interaction_id: &str,
+        interaction_token: &str,
+        body: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let url = format!(
+            "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
+        );
+
+        let resp = self.http_client().post(&url).json(&body).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            anyhow::bail!("Discord interaction callback failed ({status}): {err}");
+        }
+
+        Ok(())
+    }
+
+    async fn send_interaction_ephemeral(
+        &self,
+        interaction_id: &str,
+        interaction_token: &str,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        self.send_interaction_response(
+            interaction_id,
+            interaction_token,
+            json!({
+                "type": DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE,
+                "data": {
+                    "content": content,
+                    "flags": DISCORD_INTERACTION_FLAG_EPHEMERAL,
+                }
+            }),
+        )
+        .await
+    }
+
+    async fn send_interaction_deferred_ack(
+        &self,
+        interaction_id: &str,
+        interaction_token: &str,
+    ) -> anyhow::Result<()> {
+        self.send_interaction_response(
+            interaction_id,
+            interaction_token,
+            json!({ "type": DISCORD_INTERACTION_CALLBACK_DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE }),
+        )
+        .await
+    }
+
+    async fn resolve_application_id(&self, bot_user_id: &str) -> anyhow::Result<String> {
+        if !bot_user_id.trim().is_empty() {
+            return Ok(bot_user_id.to_string());
+        }
+
+        let resp = self
+            .http_client()
+            .get("https://discord.com/api/v10/users/@me")
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            anyhow::bail!("Discord bot identity request failed ({status}): {err}");
+        }
+
+        let data: serde_json::Value = resp.json().await?;
+        let id = data
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+
+        if id.is_empty() {
+            anyhow::bail!("Discord bot identity response did not include id");
+        }
+
+        Ok(id.to_string())
+    }
+
+    async fn ensure_slash_commands_registered(
+        &self,
+        guild_id: &str,
+        bot_user_id: &str,
+    ) -> anyhow::Result<()> {
+        if guild_id.trim().is_empty() {
+            return Ok(());
+        }
+
+        let app_id = self.resolve_application_id(bot_user_id).await?;
+        let commands_url =
+            format!("https://discord.com/api/v10/applications/{app_id}/guilds/{guild_id}/commands");
+
+        let list_resp = self
+            .http_client()
+            .get(&commands_url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .send()
+            .await?;
+
+        if !list_resp.status().is_success() {
+            let status = list_resp.status();
+            let err = list_resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            anyhow::bail!("Discord list guild commands failed ({status}): {err}");
+        }
+
+        let commands: Vec<serde_json::Value> = list_resp.json().await.unwrap_or_default();
+        let existing_names: HashSet<String> = commands
+            .iter()
+            .filter_map(|cmd| cmd.get("name").and_then(serde_json::Value::as_str))
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+
+        let slash_commands = vec![
+            json!({
+                "name": DISCORD_SLASH_NEW_COMMAND_NAME,
+                "description": DISCORD_SLASH_NEW_COMMAND_DESCRIPTION,
+                "type": 1
+            }),
+            json!({
+                "name": DISCORD_SLASH_SKILLS_COMMAND_NAME,
+                "description": DISCORD_SLASH_SKILLS_COMMAND_DESCRIPTION,
+                "type": 1
+            }),
+            json!({
+                "name": DISCORD_SLASH_SKILL_COMMAND_NAME,
+                "description": DISCORD_SLASH_SKILL_COMMAND_DESCRIPTION,
+                "type": 1,
+                "options": [
+                    {
+                        "type": 3,
+                        "name": DISCORD_SLASH_SKILL_OPTION_NAME,
+                        "description": "Skill name",
+                        "required": true
+                    },
+                    {
+                        "type": 3,
+                        "name": DISCORD_SLASH_SKILL_OPTION_INPUT,
+                        "description": "Optional skill input",
+                        "required": false
+                    }
+                ]
+            }),
+        ];
+
+        for command in slash_commands {
+            let command_name = command
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if command_name.is_empty() || existing_names.contains(&command_name) {
+                continue;
+            }
+
+            let create_resp = self
+                .http_client()
+                .post(&commands_url)
+                .header("Authorization", format!("Bot {}", self.bot_token))
+                .json(&command)
+                .send()
+                .await?;
+
+            if !create_resp.status().is_success() {
+                let status = create_resp.status();
+                let err = create_resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+                anyhow::bail!("Discord create guild command failed ({status}): {err}");
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_interaction_create_event(
+        &self,
+        payload: &serde_json::Value,
+        bot_user_id: &str,
+        guild_filter: Option<&str>,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        let Some(interaction) = parse_application_command_interaction(payload) else {
+            return Ok(());
+        };
+
+        let command_name = interaction.command_name.to_ascii_lowercase();
+        if !matches!(
+            command_name.as_str(),
+            DISCORD_SLASH_NEW_COMMAND_NAME
+                | DISCORD_SLASH_SKILLS_COMMAND_NAME
+                | DISCORD_SLASH_SKILL_COMMAND_NAME
+        ) {
+            return Ok(());
+        }
+
+        if interaction.sender_id == bot_user_id
+            || (!self.listen_to_bots && interaction.sender_is_bot)
+        {
+            let _ = self
+                .send_interaction_ephemeral(
+                    &interaction.interaction_id,
+                    &interaction.interaction_token,
+                    "Bot users cannot run this command.",
+                )
+                .await;
+            return Ok(());
+        }
+
+        if !self.is_user_allowed(&interaction.sender_id) {
+            tracing::warn!(
+                "Discord: ignoring /new from unauthorized user: {}",
+                interaction.sender_id
+            );
+            let _ = self
+                .send_interaction_ephemeral(
+                    &interaction.interaction_id,
+                    &interaction.interaction_token,
+                    "You are not in the allowed_users list.",
+                )
+                .await;
+            return Ok(());
+        }
+
+        if let Some(allowed_guild) = guild_filter {
+            if interaction
+                .guild_id
+                .as_deref()
+                .is_some_and(|g| g != allowed_guild)
+            {
+                let _ = self
+                    .send_interaction_ephemeral(
+                        &interaction.interaction_id,
+                        &interaction.interaction_token,
+                        "This command is restricted to a different guild.",
+                    )
+                    .await;
+                return Ok(());
+            }
+        }
+
+        let content = match command_name.as_str() {
+            DISCORD_SLASH_NEW_COMMAND_NAME => "/new".to_string(),
+            DISCORD_SLASH_SKILLS_COMMAND_NAME => "/skills".to_string(),
+            DISCORD_SLASH_SKILL_COMMAND_NAME => {
+                let Some(skill_name) = interaction
+                    .option_value(DISCORD_SLASH_SKILL_OPTION_NAME)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                else {
+                    let _ = self
+                        .send_interaction_ephemeral(
+                            &interaction.interaction_id,
+                            &interaction.interaction_token,
+                            "Missing required option `name` for /skill.",
+                        )
+                        .await;
+                    return Ok(());
+                };
+
+                let mut value = format!("/skill {skill_name}");
+                if let Some(input) = interaction
+                    .option_value(DISCORD_SLASH_SKILL_OPTION_INPUT)
+                    .map(str::trim)
+                    .filter(|raw| !raw.is_empty())
+                {
+                    value.push(' ');
+                    value.push_str(input);
+                }
+                value
+            }
+            _ => return Ok(()),
+        };
+
+        self.send_interaction_deferred_ack(
+            &interaction.interaction_id,
+            &interaction.interaction_token,
+        )
+        .await?;
+
+        let channel_msg = ChannelMessage {
+            id: format!("discord_interaction_{}", interaction.interaction_id),
+            sender: interaction.sender_id,
+            reply_target: interaction.channel_id,
+            content,
+            channel: "discord".to_string(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            thread_ts: None,
+        };
+
+        if tx.send(channel_msg).await.is_err() {
+            anyhow::bail!("Discord channel runtime queue closed while handling /new interaction");
+        }
+
+        Ok(())
     }
 }
 
@@ -102,6 +416,142 @@ async fn process_attachments(
 }
 
 const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const DISCORD_EVENT_MESSAGE_CREATE: &str = "MESSAGE_CREATE";
+const DISCORD_EVENT_INTERACTION_CREATE: &str = "INTERACTION_CREATE";
+const DISCORD_INTERACTION_APPLICATION_COMMAND: u64 = 2;
+const DISCORD_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE: u64 = 4;
+const DISCORD_INTERACTION_CALLBACK_DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE: u64 = 5;
+const DISCORD_INTERACTION_FLAG_EPHEMERAL: u64 = 1 << 6;
+const DISCORD_SLASH_NEW_COMMAND_NAME: &str = "new";
+const DISCORD_SLASH_NEW_COMMAND_DESCRIPTION: &str =
+    "Start a new ZeroClaw session and clear previous context";
+const DISCORD_SLASH_SKILLS_COMMAND_NAME: &str = "skills";
+const DISCORD_SLASH_SKILLS_COMMAND_DESCRIPTION: &str = "List available ZeroClaw skills";
+const DISCORD_SLASH_SKILL_COMMAND_NAME: &str = "skill";
+const DISCORD_SLASH_SKILL_COMMAND_DESCRIPTION: &str = "Run a skill in current session context";
+const DISCORD_SLASH_SKILL_OPTION_NAME: &str = "name";
+const DISCORD_SLASH_SKILL_OPTION_INPUT: &str = "input";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscordInteractionCommand {
+    interaction_id: String,
+    interaction_token: String,
+    command_name: String,
+    sender_id: String,
+    sender_is_bot: bool,
+    channel_id: String,
+    guild_id: Option<String>,
+    options: HashMap<String, String>,
+}
+
+impl DiscordInteractionCommand {
+    fn option_value(&self, key: &str) -> Option<&str> {
+        self.options
+            .get(&key.to_ascii_lowercase())
+            .map(String::as_str)
+    }
+}
+
+fn interaction_option_value_to_string(value: &serde_json::Value) -> Option<String> {
+    if let Some(v) = value.as_str() {
+        return Some(v.to_string());
+    }
+    if let Some(v) = value.as_i64() {
+        return Some(v.to_string());
+    }
+    if let Some(v) = value.as_u64() {
+        return Some(v.to_string());
+    }
+    if let Some(v) = value.as_f64() {
+        return Some(v.to_string());
+    }
+    if let Some(v) = value.as_bool() {
+        return Some(v.to_string());
+    }
+    None
+}
+
+fn collect_interaction_options(option: &serde_json::Value, map: &mut HashMap<String, String>) {
+    if let Some(name) = option.get("name").and_then(serde_json::Value::as_str) {
+        if let Some(value) = option.get("value") {
+            if let Some(parsed) = interaction_option_value_to_string(value) {
+                map.insert(name.to_ascii_lowercase(), parsed);
+            }
+        }
+    }
+
+    if let Some(children) = option.get("options").and_then(serde_json::Value::as_array) {
+        for child in children {
+            collect_interaction_options(child, map);
+        }
+    }
+}
+
+fn parse_application_command_interaction(
+    payload: &serde_json::Value,
+) -> Option<DiscordInteractionCommand> {
+    if payload.get("type").and_then(serde_json::Value::as_u64)
+        != Some(DISCORD_INTERACTION_APPLICATION_COMMAND)
+    {
+        return None;
+    }
+
+    let interaction_id = payload.get("id").and_then(serde_json::Value::as_str)?;
+    let interaction_token = payload.get("token").and_then(serde_json::Value::as_str)?;
+    let data = payload.get("data")?;
+    let command_name = data.get("name").and_then(serde_json::Value::as_str)?;
+    let sender_id = payload
+        .get("member")
+        .and_then(|m| m.get("user"))
+        .and_then(|u| u.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            payload
+                .get("user")
+                .and_then(|u| u.get("id"))
+                .and_then(serde_json::Value::as_str)
+        })?;
+    let channel_id = payload
+        .get("channel_id")
+        .and_then(serde_json::Value::as_str)?;
+
+    let sender_is_bot = payload
+        .get("member")
+        .and_then(|m| m.get("user"))
+        .and_then(|u| u.get("bot"))
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| {
+            payload
+                .get("user")
+                .and_then(|u| u.get("bot"))
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false);
+
+    let guild_id = payload
+        .get("guild_id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .filter(|id| !id.is_empty());
+
+    let mut options = HashMap::new();
+    if let Some(raw_options) = data.get("options").and_then(serde_json::Value::as_array) {
+        for option in raw_options {
+            collect_interaction_options(option, &mut options);
+        }
+    }
+
+    Some(DiscordInteractionCommand {
+        interaction_id: interaction_id.to_string(),
+        interaction_token: interaction_token.to_string(),
+        command_name: command_name.to_string(),
+        sender_id: sender_id.to_string(),
+        sender_is_bot,
+        channel_id: channel_id.to_string(),
+        guild_id,
+        options,
+    })
+}
 
 /// Discord's maximum message length for regular messages.
 ///
@@ -390,6 +840,17 @@ impl Channel for DiscordChannel {
         });
 
         let guild_filter = self.guild_id.clone();
+        if let Some(ref guild_id) = guild_filter {
+            if let Err(err) = self
+                .ensure_slash_commands_registered(guild_id, &bot_user_id)
+                .await
+            {
+                tracing::warn!(
+                    guild_id,
+                    "Discord: failed to register slash commands: {err}"
+                );
+            }
+        }
 
         loop {
             tokio::select! {
@@ -442,9 +903,29 @@ impl Channel for DiscordChannel {
                         _ => {}
                     }
 
-                    // Only handle MESSAGE_CREATE (opcode 0, type "MESSAGE_CREATE")
+                    // Handle slash command interactions first.
                     let event_type = event.get("t").and_then(|t| t.as_str()).unwrap_or("");
-                    if event_type != "MESSAGE_CREATE" {
+                    if event_type == DISCORD_EVENT_INTERACTION_CREATE {
+                        if let Some(d) = event.get("d") {
+                            if let Err(err) = self
+                                .handle_interaction_create_event(
+                                    d,
+                                    &bot_user_id,
+                                    guild_filter.as_deref(),
+                                    &tx,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Discord: failed to process interaction event: {err}"
+                                );
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Only handle MESSAGE_CREATE for channel messages.
+                    if event_type != DISCORD_EVENT_MESSAGE_CREATE {
                         continue;
                     }
 
@@ -795,6 +1276,71 @@ mod tests {
     fn normalize_incoming_content_rejects_empty_after_strip() {
         let cleaned = normalize_incoming_content("<@12345>", true, "12345");
         assert!(cleaned.is_none());
+    }
+
+    #[test]
+    fn parse_application_command_interaction_extracts_required_fields() {
+        let payload = json!({
+            "id": "interaction-1",
+            "token": "interaction-token",
+            "type": 2,
+            "channel_id": "channel-1",
+            "guild_id": "guild-1",
+            "data": { "name": "new" },
+            "member": { "user": { "id": "user-1", "bot": false } }
+        });
+
+        let parsed = parse_application_command_interaction(&payload).expect("should parse");
+        assert_eq!(parsed.interaction_id, "interaction-1");
+        assert_eq!(parsed.interaction_token, "interaction-token");
+        assert_eq!(parsed.command_name, "new");
+        assert_eq!(parsed.sender_id, "user-1");
+        assert!(!parsed.sender_is_bot);
+        assert_eq!(parsed.channel_id, "channel-1");
+        assert_eq!(parsed.guild_id.as_deref(), Some("guild-1"));
+    }
+
+    #[test]
+    fn parse_application_command_interaction_requires_application_command_type() {
+        let payload = json!({
+            "id": "interaction-1",
+            "token": "interaction-token",
+            "type": 3,
+            "channel_id": "channel-1",
+            "data": { "name": "new" },
+            "user": { "id": "user-1" }
+        });
+
+        assert!(parse_application_command_interaction(&payload).is_none());
+    }
+
+    #[test]
+    fn parse_application_command_interaction_extracts_skill_options() {
+        let payload = json!({
+            "id": "interaction-2",
+            "token": "interaction-token-2",
+            "type": 2,
+            "channel_id": "channel-2",
+            "data": {
+                "name": "skill",
+                "options": [
+                    { "name": "name", "type": 3, "value": "zeroclaw-agent-browser-skill" },
+                    { "name": "input", "type": 3, "value": "open https://example.com and get title" }
+                ]
+            },
+            "user": { "id": "user-2", "bot": false }
+        });
+
+        let parsed = parse_application_command_interaction(&payload).expect("should parse");
+        assert_eq!(parsed.command_name, "skill");
+        assert_eq!(
+            parsed.option_value("name"),
+            Some("zeroclaw-agent-browser-skill")
+        );
+        assert_eq!(
+            parsed.option_value("input"),
+            Some("open https://example.com and get title")
+        );
     }
 
     // Message splitting tests

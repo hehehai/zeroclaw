@@ -17,7 +17,7 @@ Last refreshed: **February 18, 2026**.
 - Japanese Docs Hub: [README.ja.md](README.ja.md)
 - Russian Docs Hub: [README.ru.md](README.ru.md)
 - French Docs Hub: [README.fr.md](README.fr.md)
-- Vietnamese Docs Hub: [i18n/vi/README.md](i18n/vi/README.md)
+- Vietnamese Docs Hub: [vi/README.md](vi/README.md)
 - i18n Docs Index: [i18n/README.md](i18n/README.md)
 - i18n Coverage Map: [i18n-coverage.md](i18n-coverage.md)
 

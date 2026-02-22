@@ -235,6 +235,9 @@ Lưu ý:
 - Khi `backend = "computer_use"`, agent ủy quyền hành động trình duyệt cho sidecar tại `computer_use.endpoint`.
 - `allow_remote_endpoint = false` (mặc định) từ chối mọi endpoint không phải loopback để tránh lộ ra ngoài.
 - Dùng `window_allowlist` để giới hạn cửa sổ OS mà sidecar có thể tương tác.
+- Với `backend = "agent_browser"`, hãy cài CLI và browser runtime trước:
+  - `npm install -g agent-browser`
+  - `agent-browser install`
 
 ## `[http_request]`
 
