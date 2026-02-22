@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
@@ -154,88 +154,21 @@ impl DiscordChannel {
         let app_id = self.resolve_application_id(bot_user_id).await?;
         let commands_url =
             format!("https://discord.com/api/v10/applications/{app_id}/guilds/{guild_id}/commands");
-
-        let list_resp = self
+        let sync_resp = self
             .http_client()
-            .get(&commands_url)
+            .put(&commands_url)
             .header("Authorization", format!("Bot {}", self.bot_token))
+            .json(&build_desired_slash_commands())
             .send()
             .await?;
 
-        if !list_resp.status().is_success() {
-            let status = list_resp.status();
-            let err = list_resp
+        if !sync_resp.status().is_success() {
+            let status = sync_resp.status();
+            let err = sync_resp
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-            anyhow::bail!("Discord list guild commands failed ({status}): {err}");
-        }
-
-        let commands: Vec<serde_json::Value> = list_resp.json().await.unwrap_or_default();
-        let existing_names: HashSet<String> = commands
-            .iter()
-            .filter_map(|cmd| cmd.get("name").and_then(serde_json::Value::as_str))
-            .map(|name| name.to_ascii_lowercase())
-            .collect();
-
-        let slash_commands = vec![
-            json!({
-                "name": DISCORD_SLASH_NEW_COMMAND_NAME,
-                "description": DISCORD_SLASH_NEW_COMMAND_DESCRIPTION,
-                "type": 1
-            }),
-            json!({
-                "name": DISCORD_SLASH_SKILLS_COMMAND_NAME,
-                "description": DISCORD_SLASH_SKILLS_COMMAND_DESCRIPTION,
-                "type": 1
-            }),
-            json!({
-                "name": DISCORD_SLASH_SKILL_COMMAND_NAME,
-                "description": DISCORD_SLASH_SKILL_COMMAND_DESCRIPTION,
-                "type": 1,
-                "options": [
-                    {
-                        "type": 3,
-                        "name": DISCORD_SLASH_SKILL_OPTION_NAME,
-                        "description": "Skill name",
-                        "required": true
-                    },
-                    {
-                        "type": 3,
-                        "name": DISCORD_SLASH_SKILL_OPTION_INPUT,
-                        "description": "Optional skill input",
-                        "required": false
-                    }
-                ]
-            }),
-        ];
-
-        for command in slash_commands {
-            let command_name = command
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if command_name.is_empty() || existing_names.contains(&command_name) {
-                continue;
-            }
-
-            let create_resp = self
-                .http_client()
-                .post(&commands_url)
-                .header("Authorization", format!("Bot {}", self.bot_token))
-                .json(&command)
-                .send()
-                .await?;
-
-            if !create_resp.status().is_success() {
-                let status = create_resp.status();
-                let err = create_resp
-                    .text()
-                    .await
-                    .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-                anyhow::bail!("Discord create guild command failed ({status}): {err}");
-            }
+            anyhow::bail!("Discord sync guild commands failed ({status}): {err}");
         }
 
         Ok(())
@@ -311,31 +244,84 @@ impl DiscordChannel {
             DISCORD_SLASH_NEW_COMMAND_NAME => "/new".to_string(),
             DISCORD_SLASH_SKILLS_COMMAND_NAME => "/skills".to_string(),
             DISCORD_SLASH_SKILL_COMMAND_NAME => {
-                let Some(skill_name) = interaction
-                    .option_value(DISCORD_SLASH_SKILL_OPTION_NAME)
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty())
-                else {
-                    let _ = self
-                        .send_interaction_ephemeral(
-                            &interaction.interaction_id,
-                            &interaction.interaction_token,
-                            "Missing required option `name` for /skill.",
-                        )
-                        .await;
-                    return Ok(());
-                };
-
-                let mut value = format!("/skill {skill_name}");
-                if let Some(input) = interaction
-                    .option_value(DISCORD_SLASH_SKILL_OPTION_INPUT)
-                    .map(str::trim)
-                    .filter(|raw| !raw.is_empty())
+                match interaction
+                    .subcommand_name()
+                    .unwrap_or(DISCORD_SLASH_SKILL_SUBCOMMAND_RUN)
                 {
-                    value.push(' ');
-                    value.push_str(input);
+                    DISCORD_SLASH_SKILL_SUBCOMMAND_RUN => {
+                        let Some(skill_name) = interaction
+                            .option_value(DISCORD_SLASH_SKILL_OPTION_NAME)
+                            .map(str::trim)
+                            .filter(|name| !name.is_empty())
+                        else {
+                            let _ = self
+                                .send_interaction_ephemeral(
+                                    &interaction.interaction_id,
+                                    &interaction.interaction_token,
+                                    "Missing required option `name` for `/skill run`.",
+                                )
+                                .await;
+                            return Ok(());
+                        };
+
+                        let mut value = format!("/skill {skill_name}");
+                        if let Some(input) = interaction
+                            .option_value(DISCORD_SLASH_SKILL_OPTION_INPUT)
+                            .map(str::trim)
+                            .filter(|raw| !raw.is_empty())
+                        {
+                            value.push(' ');
+                            value.push_str(input);
+                        }
+                        value
+                    }
+                    DISCORD_SLASH_SKILL_SUBCOMMAND_INSTALL => {
+                        let Some(source) = interaction
+                            .option_value(DISCORD_SLASH_SKILL_OPTION_SOURCE)
+                            .map(str::trim)
+                            .filter(|source| !source.is_empty())
+                        else {
+                            let _ = self
+                                .send_interaction_ephemeral(
+                                    &interaction.interaction_id,
+                                    &interaction.interaction_token,
+                                    "Missing required option `source` for `/skill install`.",
+                                )
+                                .await;
+                            return Ok(());
+                        };
+
+                        format!("/skills install {source}")
+                    }
+                    DISCORD_SLASH_SKILL_SUBCOMMAND_REMOVE => {
+                        let Some(name) = interaction
+                            .option_value(DISCORD_SLASH_SKILL_OPTION_NAME)
+                            .map(str::trim)
+                            .filter(|name| !name.is_empty())
+                        else {
+                            let _ = self
+                                .send_interaction_ephemeral(
+                                    &interaction.interaction_id,
+                                    &interaction.interaction_token,
+                                    "Missing required option `name` for `/skill remove`.",
+                                )
+                                .await;
+                            return Ok(());
+                        };
+
+                        format!("/skills remove {name}")
+                    }
+                    _ => {
+                        let _ = self
+                            .send_interaction_ephemeral(
+                                &interaction.interaction_id,
+                                &interaction.interaction_token,
+                                "Unsupported `/skill` subcommand.",
+                            )
+                            .await;
+                        return Ok(());
+                    }
                 }
-                value
             }
             _ => return Ok(()),
         };
@@ -428,15 +414,87 @@ const DISCORD_SLASH_NEW_COMMAND_DESCRIPTION: &str =
 const DISCORD_SLASH_SKILLS_COMMAND_NAME: &str = "skills";
 const DISCORD_SLASH_SKILLS_COMMAND_DESCRIPTION: &str = "List available ZeroClaw skills";
 const DISCORD_SLASH_SKILL_COMMAND_NAME: &str = "skill";
-const DISCORD_SLASH_SKILL_COMMAND_DESCRIPTION: &str = "Run a skill in current session context";
+const DISCORD_SLASH_SKILL_COMMAND_DESCRIPTION: &str = "Run, install, or remove ZeroClaw skills";
+const DISCORD_SLASH_SKILL_SUBCOMMAND_RUN: &str = "run";
+const DISCORD_SLASH_SKILL_SUBCOMMAND_INSTALL: &str = "install";
+const DISCORD_SLASH_SKILL_SUBCOMMAND_REMOVE: &str = "remove";
 const DISCORD_SLASH_SKILL_OPTION_NAME: &str = "name";
 const DISCORD_SLASH_SKILL_OPTION_INPUT: &str = "input";
+const DISCORD_SLASH_SKILL_OPTION_SOURCE: &str = "source";
+
+fn build_desired_slash_commands() -> Vec<serde_json::Value> {
+    vec![
+        json!({
+            "name": DISCORD_SLASH_NEW_COMMAND_NAME,
+            "description": DISCORD_SLASH_NEW_COMMAND_DESCRIPTION,
+            "type": 1
+        }),
+        json!({
+            "name": DISCORD_SLASH_SKILLS_COMMAND_NAME,
+            "description": DISCORD_SLASH_SKILLS_COMMAND_DESCRIPTION,
+            "type": 1
+        }),
+        json!({
+            "name": DISCORD_SLASH_SKILL_COMMAND_NAME,
+            "description": DISCORD_SLASH_SKILL_COMMAND_DESCRIPTION,
+            "type": 1,
+            "options": [
+                {
+                    "type": 1,
+                    "name": DISCORD_SLASH_SKILL_SUBCOMMAND_RUN,
+                    "description": "Run an installed skill in the current session",
+                    "options": [
+                        {
+                            "type": 3,
+                            "name": DISCORD_SLASH_SKILL_OPTION_NAME,
+                            "description": "Skill name",
+                            "required": true
+                        },
+                        {
+                            "type": 3,
+                            "name": DISCORD_SLASH_SKILL_OPTION_INPUT,
+                            "description": "Optional skill input",
+                            "required": false
+                        }
+                    ]
+                },
+                {
+                    "type": 1,
+                    "name": DISCORD_SLASH_SKILL_SUBCOMMAND_INSTALL,
+                    "description": "Install a skill from ClawHub URL, git URL, or local path",
+                    "options": [
+                        {
+                            "type": 3,
+                            "name": DISCORD_SLASH_SKILL_OPTION_SOURCE,
+                            "description": "Install source",
+                            "required": true
+                        }
+                    ]
+                },
+                {
+                    "type": 1,
+                    "name": DISCORD_SLASH_SKILL_SUBCOMMAND_REMOVE,
+                    "description": "Remove an installed skill",
+                    "options": [
+                        {
+                            "type": 3,
+                            "name": DISCORD_SLASH_SKILL_OPTION_NAME,
+                            "description": "Skill name",
+                            "required": true
+                        }
+                    ]
+                }
+            ]
+        }),
+    ]
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DiscordInteractionCommand {
     interaction_id: String,
     interaction_token: String,
     command_name: String,
+    subcommand: Option<String>,
     sender_id: String,
     sender_is_bot: bool,
     channel_id: String,
@@ -445,6 +503,10 @@ struct DiscordInteractionCommand {
 }
 
 impl DiscordInteractionCommand {
+    fn subcommand_name(&self) -> Option<&str> {
+        self.subcommand.as_deref()
+    }
+
     fn option_value(&self, key: &str) -> Option<&str> {
         self.options
             .get(&key.to_ascii_lowercase())
@@ -534,9 +596,20 @@ fn parse_application_command_interaction(
         .map(ToString::to_string)
         .filter(|id| !id.is_empty());
 
+    let mut subcommand = None;
     let mut options = HashMap::new();
     if let Some(raw_options) = data.get("options").and_then(serde_json::Value::as_array) {
         for option in raw_options {
+            if option
+                .get("type")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|value| value == 1)
+            {
+                subcommand = option
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_ascii_lowercase);
+            }
             collect_interaction_options(option, &mut options);
         }
     }
@@ -545,6 +618,7 @@ fn parse_application_command_interaction(
         interaction_id: interaction_id.to_string(),
         interaction_token: interaction_token.to_string(),
         command_name: command_name.to_string(),
+        subcommand,
         sender_id: sender_id.to_string(),
         sender_is_bot,
         channel_id: channel_id.to_string(),
@@ -658,6 +732,16 @@ fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
     content.contains(&tags[0]) || content.contains(&tags[1])
 }
 
+fn strip_leading_bot_mention(content: &str, bot_user_id: &str) -> String {
+    let trimmed = content.trim_start();
+    for tag in mention_tags(bot_user_id) {
+        if let Some(rest) = trimmed.strip_prefix(&tag) {
+            return rest.trim_start().to_string();
+        }
+    }
+    content.to_string()
+}
+
 fn normalize_incoming_content(
     content: &str,
     mention_only: bool,
@@ -671,7 +755,11 @@ fn normalize_incoming_content(
         return None;
     }
 
-    let mut normalized = content.to_string();
+    let mut normalized = if mention_only {
+        content.to_string()
+    } else {
+        strip_leading_bot_mention(content, bot_user_id)
+    };
     if mention_only {
         for tag in mention_tags(bot_user_id) {
             normalized = normalized.replace(&tag, " ");
@@ -1279,6 +1367,12 @@ mod tests {
     }
 
     #[test]
+    fn normalize_incoming_content_strips_leading_mention_when_mention_only_disabled() {
+        let cleaned = normalize_incoming_content("<@!12345> /skills remove gog", false, "12345");
+        assert_eq!(cleaned.as_deref(), Some("/skills remove gog"));
+    }
+
+    #[test]
     fn parse_application_command_interaction_extracts_required_fields() {
         let payload = json!({
             "id": "interaction-1",
@@ -1324,8 +1418,14 @@ mod tests {
             "data": {
                 "name": "skill",
                 "options": [
-                    { "name": "name", "type": 3, "value": "zeroclaw-agent-browser-skill" },
-                    { "name": "input", "type": 3, "value": "open https://example.com and get title" }
+                    {
+                        "type": 1,
+                        "name": "run",
+                        "options": [
+                            { "name": "name", "type": 3, "value": "zeroclaw-agent-browser-skill" },
+                            { "name": "input", "type": 3, "value": "open https://example.com and get title" }
+                        ]
+                    }
                 ]
             },
             "user": { "id": "user-2", "bot": false }
@@ -1333,6 +1433,7 @@ mod tests {
 
         let parsed = parse_application_command_interaction(&payload).expect("should parse");
         assert_eq!(parsed.command_name, "skill");
+        assert_eq!(parsed.subcommand_name(), Some("run"));
         assert_eq!(
             parsed.option_value("name"),
             Some("zeroclaw-agent-browser-skill")
@@ -1341,6 +1442,54 @@ mod tests {
             parsed.option_value("input"),
             Some("open https://example.com and get title")
         );
+    }
+
+    #[test]
+    fn parse_application_command_interaction_legacy_skill_options_without_subcommand() {
+        let payload = json!({
+            "id": "interaction-3",
+            "token": "interaction-token-3",
+            "type": 2,
+            "channel_id": "channel-3",
+            "data": {
+                "name": "skill",
+                "options": [
+                    { "name": "name", "type": 3, "value": "browser-flow" }
+                ]
+            },
+            "user": { "id": "user-3", "bot": false }
+        });
+
+        let parsed = parse_application_command_interaction(&payload).expect("should parse");
+        assert_eq!(parsed.command_name, "skill");
+        assert_eq!(parsed.subcommand_name(), None);
+        assert_eq!(parsed.option_value("name"), Some("browser-flow"));
+    }
+
+    #[test]
+    fn build_desired_slash_commands_includes_skill_subcommands() {
+        let commands = build_desired_slash_commands();
+        let skill = commands
+            .iter()
+            .find(|command| {
+                command
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| name == DISCORD_SLASH_SKILL_COMMAND_NAME)
+            })
+            .expect("skill command should be present");
+
+        let options = skill
+            .get("options")
+            .and_then(serde_json::Value::as_array)
+            .expect("skill command should include options");
+        let subcommands: Vec<&str> = options
+            .iter()
+            .filter_map(|option| option.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        assert!(subcommands.contains(&DISCORD_SLASH_SKILL_SUBCOMMAND_RUN));
+        assert!(subcommands.contains(&DISCORD_SLASH_SKILL_SUBCOMMAND_INSTALL));
+        assert!(subcommands.contains(&DISCORD_SLASH_SKILL_SUBCOMMAND_REMOVE));
     }
 
     // Message splitting tests

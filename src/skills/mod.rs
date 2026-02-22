@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -11,6 +12,15 @@ mod audit;
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
+const CLAWHUB_SKILLS_API_BASE_URL: &str = "https://clawhub.ai/api/v1";
+const CLAWHUB_FALLBACK_DOWNLOAD_API_BASE_URL: &str = "https://wry-manatee-359.convex.site/api/v1";
+const SKILL_INSTALL_USER_AGENT: &str = "ZeroClaw-Skills/1.0";
+
+#[derive(Debug, Clone)]
+pub struct SkillInstallReport {
+    pub installed_dir: PathBuf,
+    pub files_scanned: usize,
+}
 
 /// A skill is a user-defined or community-built capability.
 /// Skills live in `~/.zeroclaw/workspace/skills/<name>/SKILL.md`
@@ -65,6 +75,22 @@ struct SkillMeta {
     author: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClawHubSkillRef {
+    owner: String,
+    slug: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClawHubSkillLookupResponse {
+    owner: ClawHubOwner,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClawHubOwner {
+    handle: String,
 }
 
 fn default_version() -> String {
@@ -676,6 +702,229 @@ fn is_git_scp_source(source: &str) -> bool {
         && !host.contains('\\')
 }
 
+fn is_simple_path_token(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
+}
+
+fn parse_clawhub_skill_url(source: &str) -> Option<ClawHubSkillRef> {
+    let url = reqwest::Url::parse(source).ok()?;
+    if !matches!(url.scheme(), "https" | "http") {
+        return None;
+    }
+
+    let host = url.host_str()?;
+    if !host.eq_ignore_ascii_case("clawhub.ai") && !host.eq_ignore_ascii_case("www.clawhub.ai") {
+        return None;
+    }
+
+    let mut segments = url.path_segments()?.filter(|segment| !segment.is_empty());
+    let owner = segments.next()?;
+    let slug = segments.next()?;
+    if segments.next().is_some() {
+        return None;
+    }
+    if !is_simple_path_token(owner) || !is_simple_path_token(slug) {
+        return None;
+    }
+
+    Some(ClawHubSkillRef {
+        owner: owner.to_string(),
+        slug: slug.to_string(),
+    })
+}
+
+fn verify_clawhub_owner(
+    client: &reqwest::blocking::Client,
+    skill_ref: &ClawHubSkillRef,
+) -> Result<()> {
+    let lookup_url = format!(
+        "{CLAWHUB_SKILLS_API_BASE_URL}/skills/{}",
+        urlencoding::encode(&skill_ref.slug)
+    );
+    let response = client
+        .get(&lookup_url)
+        .header(reqwest::header::USER_AGENT, SKILL_INSTALL_USER_AGENT)
+        .send()
+        .with_context(|| format!("failed to query ClawHub metadata for '{}'", skill_ref.slug))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .unwrap_or_else(|err| format!("<failed to read response body: {err}>"));
+        anyhow::bail!("ClawHub metadata request failed ({status}): {body}");
+    }
+
+    let payload: ClawHubSkillLookupResponse = response
+        .json()
+        .context("failed to parse ClawHub metadata response")?;
+
+    if !payload.owner.handle.eq_ignore_ascii_case(&skill_ref.owner) {
+        anyhow::bail!(
+            "ClawHub owner mismatch for '{}': expected '{}', got '{}'",
+            skill_ref.slug,
+            skill_ref.owner,
+            payload.owner.handle
+        );
+    }
+
+    Ok(())
+}
+
+fn should_try_clawhub_download_fallback(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::FORBIDDEN
+}
+
+fn download_clawhub_skill_zip(
+    client: &reqwest::blocking::Client,
+    skill_ref: &ClawHubSkillRef,
+) -> Result<Vec<u8>> {
+    let slug = urlencoding::encode(&skill_ref.slug);
+    let primary_download_url = format!("{CLAWHUB_SKILLS_API_BASE_URL}/download?slug={slug}");
+    let fallback_download_url =
+        format!("{CLAWHUB_FALLBACK_DOWNLOAD_API_BASE_URL}/download?slug={slug}");
+
+    let primary_response = client
+        .get(&primary_download_url)
+        .header(reqwest::header::USER_AGENT, SKILL_INSTALL_USER_AGENT)
+        .send();
+
+    match primary_response {
+        Ok(response) if response.status().is_success() => {
+            return response
+                .bytes()
+                .map(|payload| payload.to_vec())
+                .context("failed to read ClawHub download payload");
+        }
+        Ok(response) if should_try_clawhub_download_fallback(response.status()) => {
+            tracing::warn!(
+                "primary ClawHub download endpoint failed with {}; trying fallback endpoint",
+                response.status()
+            );
+        }
+        Ok(response) => {
+            let status = response.status();
+            let body = response
+                .text()
+                .unwrap_or_else(|err| format!("<failed to read response body: {err}>"));
+            anyhow::bail!("ClawHub download request failed ({status}): {body}");
+        }
+        Err(err) => {
+            tracing::warn!("primary ClawHub download endpoint request failed: {err}");
+        }
+    }
+
+    let fallback_response = client
+        .get(&fallback_download_url)
+        .header(reqwest::header::USER_AGENT, SKILL_INSTALL_USER_AGENT)
+        .send()
+        .context("failed to query fallback ClawHub download endpoint")?;
+
+    if !fallback_response.status().is_success() {
+        let status = fallback_response.status();
+        let body = fallback_response
+            .text()
+            .unwrap_or_else(|err| format!("<failed to read response body: {err}>"));
+        anyhow::bail!("ClawHub fallback download request failed ({status}): {body}");
+    }
+
+    fallback_response
+        .bytes()
+        .map(|payload| payload.to_vec())
+        .context("failed to read ClawHub fallback download payload")
+}
+
+fn contains_skill_manifest(path: &Path) -> bool {
+    path.join("SKILL.toml").is_file() || path.join("SKILL.md").is_file()
+}
+
+fn extract_skill_zip_archive(zip_bytes: &[u8], extract_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(extract_dir)?;
+    let cursor = Cursor::new(zip_bytes);
+    let mut archive = zip::ZipArchive::new(cursor).context("failed to parse skill zip archive")?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .with_context(|| format!("failed to read zip entry at index {index}"))?;
+
+        let Some(enclosed_name) = entry.enclosed_name().map(PathBuf::from) else {
+            anyhow::bail!("zip archive contains unsafe entry path: {}", entry.name());
+        };
+
+        if enclosed_name.as_os_str().is_empty() {
+            continue;
+        }
+
+        if entry
+            .unix_mode()
+            .is_some_and(|mode| (mode & 0o170000) == 0o120000)
+        {
+            anyhow::bail!(
+                "zip archive contains unsupported symlink entry: {}",
+                entry.name()
+            );
+        }
+
+        let output_path = extract_dir.join(&enclosed_name);
+        if !output_path.starts_with(extract_dir) {
+            anyhow::bail!(
+                "zip archive entry escapes extraction directory: {}",
+                entry.name()
+            );
+        }
+
+        if entry.name().ends_with('/') {
+            std::fs::create_dir_all(&output_path)
+                .with_context(|| format!("failed to create directory {}", output_path.display()))?;
+            continue;
+        }
+
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create parent directory {} for extracted entry",
+                    parent.display()
+                )
+            })?;
+        }
+
+        let mut output = std::fs::File::create(&output_path).with_context(|| {
+            format!("failed to create extracted file {}", output_path.display())
+        })?;
+        std::io::copy(&mut entry, &mut output)
+            .with_context(|| format!("failed to extract file {}", output_path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn locate_extracted_skill_root(extract_dir: &Path) -> Result<PathBuf> {
+    if contains_skill_manifest(extract_dir) {
+        return Ok(extract_dir.to_path_buf());
+    }
+
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(extract_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() && contains_skill_manifest(&path) {
+            candidates.push(path);
+        }
+    }
+
+    match candidates.len() {
+        1 => Ok(candidates.remove(0)),
+        0 => anyhow::bail!("downloaded archive did not include SKILL.toml or SKILL.md"),
+        _ => anyhow::bail!("downloaded archive included multiple skill roots; install manually"),
+    }
+}
+
 fn snapshot_skill_children(skills_path: &Path) -> Result<HashSet<PathBuf>> {
     let mut paths = HashSet::new();
     for entry in std::fs::read_dir(skills_path)? {
@@ -827,6 +1076,96 @@ fn install_git_skill_source(source: &str, skills_path: &Path) -> Result<(PathBuf
     }
 }
 
+fn install_clawhub_skill_source(source: &str, skills_path: &Path) -> Result<(PathBuf, usize)> {
+    let skill_ref = parse_clawhub_skill_url(source)
+        .context("invalid ClawHub skill URL; expected /<owner>/<slug>")?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .context("failed to build HTTP client for ClawHub skill install")?;
+
+    verify_clawhub_owner(&client, &skill_ref)?;
+    let archive_bytes = download_clawhub_skill_zip(&client, &skill_ref)?;
+
+    let extract_dir =
+        tempfile::tempdir().context("failed to allocate temporary extraction directory")?;
+    extract_skill_zip_archive(&archive_bytes, extract_dir.path())?;
+    let extracted_skill_root = locate_extracted_skill_root(extract_dir.path())?;
+    let _ = enforce_skill_security_audit(&extracted_skill_root)?;
+
+    let dest = skills_path.join(&skill_ref.slug);
+    if dest.exists() {
+        anyhow::bail!("Destination skill already exists: {}", dest.display());
+    }
+
+    if let Err(err) = copy_dir_recursive_secure(&extracted_skill_root, &dest) {
+        let _ = std::fs::remove_dir_all(&dest);
+        return Err(err);
+    }
+
+    match enforce_skill_security_audit(&dest) {
+        Ok(report) => Ok((dest, report.files_scanned)),
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&dest);
+            Err(err)
+        }
+    }
+}
+
+pub fn install_skill_from_source(source: &str, workspace_dir: &Path) -> Result<SkillInstallReport> {
+    let source = source.trim();
+    if source.is_empty() {
+        anyhow::bail!("Skill source cannot be empty.");
+    }
+
+    let skills_path = skills_dir(workspace_dir);
+    std::fs::create_dir_all(&skills_path)?;
+
+    let (installed_dir, files_scanned) = if parse_clawhub_skill_url(source).is_some() {
+        install_clawhub_skill_source(source, &skills_path)
+            .with_context(|| format!("failed to install ClawHub skill source: {source}"))?
+    } else if is_git_source(source) {
+        install_git_skill_source(source, &skills_path)
+            .with_context(|| format!("failed to install git skill source: {source}"))?
+    } else {
+        install_local_skill_source(source, &skills_path)
+            .with_context(|| format!("failed to install local skill source: {source}"))?
+    };
+
+    Ok(SkillInstallReport {
+        installed_dir,
+        files_scanned,
+    })
+}
+
+pub fn remove_installed_skill(name: &str, workspace_dir: &Path) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        anyhow::bail!("Skill name cannot be empty.");
+    }
+
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
+        anyhow::bail!("Invalid skill name: {name}");
+    }
+
+    let skill_path = skills_dir(workspace_dir).join(name);
+    let canonical_skills = skills_dir(workspace_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| skills_dir(workspace_dir));
+    if let Ok(canonical_skill) = skill_path.canonicalize() {
+        if !canonical_skill.starts_with(&canonical_skills) {
+            anyhow::bail!("Skill path escapes skills directory: {name}");
+        }
+    }
+
+    if !skill_path.exists() {
+        anyhow::bail!("Skill not found: {name}");
+    }
+
+    std::fs::remove_dir_all(&skill_path)?;
+    Ok(())
+}
+
 /// Handle the `skills` CLI command
 #[allow(clippy::too_many_lines)]
 pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Config) -> Result<()> {
@@ -905,57 +1244,19 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
         }
         crate::SkillCommands::Install { source } => {
             println!("Installing skill from: {source}");
-
-            let skills_path = skills_dir(workspace_dir);
-            std::fs::create_dir_all(&skills_path)?;
-
-            if is_git_source(&source) {
-                let (installed_dir, files_scanned) =
-                    install_git_skill_source(&source, &skills_path)
-                        .with_context(|| format!("failed to install git skill source: {source}"))?;
-                println!(
-                    "  {} Skill installed and audited: {} ({} files scanned)",
-                    console::style("✓").green().bold(),
-                    installed_dir.display(),
-                    files_scanned
-                );
-            } else {
-                let (dest, files_scanned) = install_local_skill_source(&source, &skills_path)
-                    .with_context(|| format!("failed to install local skill source: {source}"))?;
-                println!(
-                    "  {} Skill installed and audited: {} ({} files scanned)",
-                    console::style("✓").green().bold(),
-                    dest.display(),
-                    files_scanned
-                );
-            }
+            let report = install_skill_from_source(&source, workspace_dir)?;
+            println!(
+                "  {} Skill installed and audited: {} ({} files scanned)",
+                console::style("✓").green().bold(),
+                report.installed_dir.display(),
+                report.files_scanned
+            );
 
             println!("  Security audit completed successfully.");
             Ok(())
         }
         crate::SkillCommands::Remove { name } => {
-            // Reject path traversal attempts
-            if name.contains("..") || name.contains('/') || name.contains('\\') {
-                anyhow::bail!("Invalid skill name: {name}");
-            }
-
-            let skill_path = skills_dir(workspace_dir).join(&name);
-
-            // Verify the resolved path is actually inside the skills directory
-            let canonical_skills = skills_dir(workspace_dir)
-                .canonicalize()
-                .unwrap_or_else(|_| skills_dir(workspace_dir));
-            if let Ok(canonical_skill) = skill_path.canonicalize() {
-                if !canonical_skill.starts_with(&canonical_skills) {
-                    anyhow::bail!("Skill path escapes skills directory: {name}");
-                }
-            }
-
-            if !skill_path.exists() {
-                anyhow::bail!("Skill not found: {name}");
-            }
-
-            std::fs::remove_dir_all(&skill_path)?;
+            remove_installed_skill(&name, workspace_dir)?;
             println!(
                 "  {} Skill '{}' removed.",
                 console::style("✓").green().bold(),
@@ -971,6 +1272,7 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
     use std::sync::{Mutex, OnceLock};
 
     fn open_skills_env_lock() -> &'static Mutex<()> {
@@ -1366,6 +1668,54 @@ description = "Bare minimum"
                 "expected local/invalid source detection for '{source}'"
             );
         }
+    }
+
+    #[test]
+    fn parse_clawhub_skill_url_accepts_owner_and_slug() {
+        let parsed = parse_clawhub_skill_url("https://clawhub.ai/steipete/gog?from=discord")
+            .expect("clawhub url should parse");
+        assert_eq!(parsed.owner, "steipete");
+        assert_eq!(parsed.slug, "gog");
+    }
+
+    #[test]
+    fn parse_clawhub_skill_url_rejects_invalid_shapes() {
+        assert!(parse_clawhub_skill_url("https://clawhub.ai/owner/slug/extra").is_none());
+        assert!(parse_clawhub_skill_url("https://example.com/owner/slug").is_none());
+        assert!(parse_clawhub_skill_url("https://clawhub.ai/owner").is_none());
+    }
+
+    #[test]
+    fn extract_skill_zip_archive_rejects_path_traversal_entries() {
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            writer
+                .start_file("../SKILL.md", zip::write::FileOptions::default())
+                .unwrap();
+            writer.write_all(b"# bad").unwrap();
+            writer.finish().unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = extract_skill_zip_archive(cursor.get_ref(), dir.path()).unwrap_err();
+        assert!(err.to_string().contains("unsafe entry path"));
+    }
+
+    #[test]
+    fn extract_skill_zip_archive_rejects_symlink_entries() {
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            writer
+                .add_symlink("link", "SKILL.md", zip::write::FileOptions::default())
+                .unwrap();
+            writer.finish().unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = extract_skill_zip_archive(cursor.get_ref(), dir.path()).unwrap_err();
+        assert!(err.to_string().contains("symlink entry"));
     }
 
     #[test]

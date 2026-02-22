@@ -145,14 +145,19 @@ Runtime in-chat commands (Telegram/Discord while channel server is running):
 - `/model`
 - `/model <model-id>`
 - `/skills` — list loaded skills for current runtime
+- `/skills install <source>` — install and audit a skill during runtime
+- `/skills remove <name>` — remove an installed skill during runtime
 - `/skill <name> [input]` — run a specific skill in current sender session
 - `/new` (or `/clear`) — reset sender session context
 
 Discord note:
 
-- ZeroClaw auto-registers slash commands `/new`, `/skills`, and `/skill` (guild scope when `channels_config.discord.guild_id` is set).
+- ZeroClaw auto-registers slash commands `/new`, `/skills`, and `/skill` (guild scope when `channels_config.discord.guild_id` is set), and syncs their definitions on startup.
 - `/new` clears the current sender session history and starts a fresh context.
-- `/skill` requires a `name` option and accepts optional `input`; ZeroClaw forwards it into the current sender session workflow.
+- `/skill` uses subcommands:
+  - `/skill run name:<skill> [input:<text>]`
+  - `/skill install source:<url-or-path>`
+  - `/skill remove name:<skill>`
 
 Channel runtime also watches `config.toml` and hot-applies updates to:
 - `default_provider`
@@ -174,7 +179,10 @@ Channel runtime also watches `config.toml` and hot-applies updates to:
 - `zeroclaw skills install <source>`
 - `zeroclaw skills remove <name>`
 
-`<source>` accepts git remotes (`https://...`, `http://...`, `ssh://...`, and `git@host:owner/repo.git`) or a local filesystem path.
+`<source>` accepts:
+- ClawHub skill URLs (`https://clawhub.ai/<owner>/<slug>`)
+- git remotes (`https://...`, `http://...`, `ssh://...`, and `git@host:owner/repo.git`)
+- local filesystem paths
 
 `skills install` always runs a built-in static security audit before the skill is accepted. The audit blocks:
 - symlinks inside the skill package
