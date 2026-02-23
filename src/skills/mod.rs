@@ -1138,6 +1138,103 @@ pub fn install_skill_from_source(source: &str, workspace_dir: &Path) -> Result<S
     })
 }
 
+const SKILL_CREATE_NAME_MAX_CHARS: usize = 64;
+const SKILL_CREATE_PROMPT_MAX_CHARS: usize = 2_000;
+
+fn normalize_skill_name_for_create(raw_name: &str) -> Result<String> {
+    let normalized = raw_name.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        anyhow::bail!("Skill name cannot be empty.");
+    }
+
+    if normalized.chars().count() > SKILL_CREATE_NAME_MAX_CHARS {
+        anyhow::bail!("Skill name is too long (max {SKILL_CREATE_NAME_MAX_CHARS} characters).");
+    }
+
+    if !normalized
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_')
+    {
+        anyhow::bail!(
+            "Invalid skill name: {normalized}. Use only lowercase letters, digits, `-`, and `_`."
+        );
+    }
+
+    Ok(normalized)
+}
+
+fn summarize_skill_prompt(prompt: &str) -> String {
+    let first_line = prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("User-defined skill instructions.");
+
+    let max_chars = 120usize;
+    let char_count = first_line.chars().count();
+    if char_count <= max_chars {
+        return first_line.to_string();
+    }
+
+    let mut truncated: String = first_line.chars().take(max_chars - 1).collect();
+    truncated.push('…');
+    truncated
+}
+
+fn render_skill_markdown_template(skill_name: &str, prompt: &str) -> String {
+    let description = summarize_skill_prompt(prompt);
+    format!(
+        "# {skill_name}\n\n\
+{description}\n\n\
+## When to use\n\
+- Use this skill when the request matches this scope.\n\n\
+## Instructions\n\
+{prompt}\n\n\
+## Constraints\n\
+- Keep actions deterministic and safe.\n\
+- Ask one concise clarification question if required input is missing.\n\
+- Do not expose secrets or sensitive values.\n\n\
+## Output format\n\
+- Return concise, actionable steps.\n\
+- Include verification notes when actions modify files or state.\n"
+    )
+}
+
+pub fn create_skill_from_prompt(name: &str, prompt: &str, workspace_dir: &Path) -> Result<PathBuf> {
+    let skill_name = normalize_skill_name_for_create(name)?;
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        anyhow::bail!("Skill prompt cannot be empty.");
+    }
+    if prompt.chars().count() > SKILL_CREATE_PROMPT_MAX_CHARS {
+        anyhow::bail!("Skill prompt is too long (max {SKILL_CREATE_PROMPT_MAX_CHARS} characters).");
+    }
+
+    let skills_path = skills_dir(workspace_dir);
+    std::fs::create_dir_all(&skills_path)?;
+
+    let skill_path = skills_path.join(&skill_name);
+    if skill_path.exists() {
+        anyhow::bail!("Skill already exists: {skill_name}");
+    }
+
+    std::fs::create_dir_all(&skill_path)?;
+    let skill_md_path = skill_path.join("SKILL.md");
+    let content = render_skill_markdown_template(&skill_name, prompt);
+
+    if let Err(err) = std::fs::write(&skill_md_path, content) {
+        let _ = std::fs::remove_dir_all(&skill_path);
+        return Err(err).with_context(|| {
+            format!(
+                "failed to write skill file for `{skill_name}` at {}",
+                skill_md_path.display()
+            )
+        });
+    }
+
+    Ok(skill_md_path)
+}
+
 pub fn remove_installed_skill(name: &str, workspace_dir: &Path) -> Result<()> {
     let name = name.trim();
     if name.is_empty() {
@@ -1668,6 +1765,46 @@ description = "Bare minimum"
                 "expected local/invalid source detection for '{source}'"
             );
         }
+    }
+
+    #[test]
+    fn create_skill_from_prompt_creates_template_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_path = create_skill_from_prompt(
+            "Browser-Flow",
+            "Open a page, check title, and return concise validation steps.",
+            dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            skill_path,
+            dir.path().join("skills/browser-flow/SKILL.md"),
+            "skill path should use normalized lowercase name"
+        );
+        assert!(skill_path.exists());
+        let content = fs::read_to_string(skill_path).unwrap();
+        assert!(content.contains("# browser-flow"));
+        assert!(content.contains("## Instructions"));
+        assert!(content.contains("Open a page, check title"));
+    }
+
+    #[test]
+    fn create_skill_from_prompt_rejects_existing_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("skills").join("browser-flow");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), "# browser-flow").unwrap();
+
+        let err = create_skill_from_prompt("browser-flow", "Do work", dir.path()).unwrap_err();
+        assert!(err.to_string().contains("Skill already exists"));
+    }
+
+    #[test]
+    fn create_skill_from_prompt_rejects_invalid_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = create_skill_from_prompt("browser flow", "Do work", dir.path()).unwrap_err();
+        assert!(err.to_string().contains("Invalid skill name"));
     }
 
     #[test]

@@ -2,8 +2,10 @@ use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
+use reqwest::multipart::{Form, Part};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
@@ -174,6 +176,75 @@ impl DiscordChannel {
         Ok(())
     }
 
+    async fn send_text_message(&self, channel_id: &str, content: &str) -> anyhow::Result<()> {
+        let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
+        let body = json!({ "content": content });
+
+        let resp = self
+            .http_client()
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            anyhow::bail!("Discord send message failed ({status}): {err}");
+        }
+
+        Ok(())
+    }
+
+    async fn send_message_with_image_attachments(
+        &self,
+        channel_id: &str,
+        content: &str,
+        image_paths: &[PathBuf],
+    ) -> anyhow::Result<()> {
+        let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
+        let mut form = Form::new().text("payload_json", json!({ "content": content }).to_string());
+
+        for (idx, path) in image_paths.iter().enumerate() {
+            let bytes = tokio::fs::read(path).await.map_err(|e| {
+                anyhow::anyhow!("Failed to read attachment '{}': {e}", path.display())
+            })?;
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("image.png")
+                .to_string();
+            let part = Part::bytes(bytes)
+                .file_name(filename)
+                .mime_str(infer_image_mime(path))
+                .map_err(|e| anyhow::anyhow!("Failed to set attachment MIME type: {e}"))?;
+            form = form.part(format!("files[{idx}]"), part);
+        }
+
+        let resp = self
+            .http_client()
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .multipart(form)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            anyhow::bail!("Discord send attachment message failed ({status}): {err}");
+        }
+
+        Ok(())
+    }
+
     async fn handle_interaction_create_event(
         &self,
         payload: &serde_json::Value,
@@ -293,6 +364,39 @@ impl DiscordChannel {
 
                         format!("/skills install {source}")
                     }
+                    DISCORD_SLASH_SKILL_SUBCOMMAND_CREATE => {
+                        let Some(name) = interaction
+                            .option_value(DISCORD_SLASH_SKILL_OPTION_NAME)
+                            .map(str::trim)
+                            .filter(|name| !name.is_empty())
+                        else {
+                            let _ = self
+                                .send_interaction_ephemeral(
+                                    &interaction.interaction_id,
+                                    &interaction.interaction_token,
+                                    "Missing required option `name` for `/skill create`.",
+                                )
+                                .await;
+                            return Ok(());
+                        };
+
+                        let Some(prompt) = interaction
+                            .option_value(DISCORD_SLASH_SKILL_OPTION_PROMPT)
+                            .map(str::trim)
+                            .filter(|prompt| !prompt.is_empty())
+                        else {
+                            let _ = self
+                                .send_interaction_ephemeral(
+                                    &interaction.interaction_id,
+                                    &interaction.interaction_token,
+                                    "Missing required option `prompt` for `/skill create`.",
+                                )
+                                .await;
+                            return Ok(());
+                        };
+
+                        format!("/skill create name:{name} prompt:{prompt}")
+                    }
                     DISCORD_SLASH_SKILL_SUBCOMMAND_REMOVE => {
                         let Some(name) = interaction
                             .option_value(DISCORD_SLASH_SKILL_OPTION_NAME)
@@ -326,9 +430,10 @@ impl DiscordChannel {
             _ => return Ok(()),
         };
 
-        self.send_interaction_deferred_ack(
+        self.send_interaction_ephemeral(
             &interaction.interaction_id,
             &interaction.interaction_token,
+            "✅ Command accepted. Processing now; result will be posted in this channel.",
         )
         .await?;
 
@@ -414,12 +519,15 @@ const DISCORD_SLASH_NEW_COMMAND_DESCRIPTION: &str =
 const DISCORD_SLASH_SKILLS_COMMAND_NAME: &str = "skills";
 const DISCORD_SLASH_SKILLS_COMMAND_DESCRIPTION: &str = "List available ZeroClaw skills";
 const DISCORD_SLASH_SKILL_COMMAND_NAME: &str = "skill";
-const DISCORD_SLASH_SKILL_COMMAND_DESCRIPTION: &str = "Run, install, or remove ZeroClaw skills";
+const DISCORD_SLASH_SKILL_COMMAND_DESCRIPTION: &str =
+    "Run, create, install, or remove ZeroClaw skills";
 const DISCORD_SLASH_SKILL_SUBCOMMAND_RUN: &str = "run";
+const DISCORD_SLASH_SKILL_SUBCOMMAND_CREATE: &str = "create";
 const DISCORD_SLASH_SKILL_SUBCOMMAND_INSTALL: &str = "install";
 const DISCORD_SLASH_SKILL_SUBCOMMAND_REMOVE: &str = "remove";
 const DISCORD_SLASH_SKILL_OPTION_NAME: &str = "name";
 const DISCORD_SLASH_SKILL_OPTION_INPUT: &str = "input";
+const DISCORD_SLASH_SKILL_OPTION_PROMPT: &str = "prompt";
 const DISCORD_SLASH_SKILL_OPTION_SOURCE: &str = "source";
 
 fn build_desired_slash_commands() -> Vec<serde_json::Value> {
@@ -455,6 +563,25 @@ fn build_desired_slash_commands() -> Vec<serde_json::Value> {
                             "name": DISCORD_SLASH_SKILL_OPTION_INPUT,
                             "description": "Optional skill input",
                             "required": false
+                        }
+                    ]
+                },
+                {
+                    "type": 1,
+                    "name": DISCORD_SLASH_SKILL_SUBCOMMAND_CREATE,
+                    "description": "Create a new local skill from a prompt",
+                    "options": [
+                        {
+                            "type": 3,
+                            "name": DISCORD_SLASH_SKILL_OPTION_NAME,
+                            "description": "New skill name (letters, digits, - and _)",
+                            "required": true
+                        },
+                        {
+                            "type": 3,
+                            "name": DISCORD_SLASH_SKILL_OPTION_PROMPT,
+                            "description": "Skill instructions",
+                            "required": true
                         }
                     ]
                 },
@@ -681,6 +808,215 @@ fn split_message_for_discord(message: &str) -> Vec<String> {
     chunks
 }
 
+fn is_image_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+            )
+        })
+}
+
+fn infer_image_mime(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => "application/octet-stream",
+    }
+}
+
+fn attachment_search_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        roots.push(home.join(".zeroclaw").join("workspace"));
+        roots.push(home.join(".agent-browser").join("tmp").join("screenshots"));
+        roots.push(home.join(".agent-browser").join("tmp"));
+    }
+
+    roots.push(PathBuf::from("/tmp"));
+
+    let mut deduped = Vec::new();
+    let mut seen = HashSet::new();
+    for root in roots {
+        if seen.insert(root.clone()) {
+            deduped.push(root);
+        }
+    }
+
+    deduped
+}
+
+fn normalize_path_token_for_attachment_with_roots(
+    token: &str,
+    search_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    let trimmed = token.trim().trim_matches(|c: char| {
+        matches!(
+            c,
+            '`' | '"'
+                | '\''
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '<'
+                | '>'
+                | ','
+                | ';'
+                | ':'
+                | '，'
+                | '；'
+                | '：'
+                | '。'
+                | '！'
+                | '？'
+        )
+    });
+    let candidate = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+
+    if candidate.is_empty() || candidate.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let path = PathBuf::from(candidate);
+    if path.is_absolute() {
+        if path.is_file() && is_image_extension(&path) {
+            return Some(path);
+        }
+        return None;
+    }
+
+    if path.is_file() && is_image_extension(&path) {
+        return Some(path);
+    }
+
+    for root in search_roots {
+        let resolved = root.join(&path);
+        if resolved.is_file() && is_image_extension(&resolved) {
+            return Some(resolved);
+        }
+    }
+
+    None
+}
+
+fn normalize_path_token_for_attachment(token: &str) -> Option<PathBuf> {
+    let search_roots = attachment_search_roots();
+    normalize_path_token_for_attachment_with_roots(token, &search_roots)
+}
+
+fn extract_image_paths_by_scanning(message: &str) -> Vec<PathBuf> {
+    let mut results = Vec::new();
+    let mut seen = HashSet::new();
+    let chars: Vec<(usize, char)> = message.char_indices().collect();
+
+    for (idx, ch) in &chars {
+        if *ch != '/' {
+            continue;
+        }
+
+        let mut end = message.len();
+        for (next_idx, next_ch) in message[*idx..].char_indices().skip(1) {
+            if next_ch.is_whitespace()
+                || matches!(
+                    next_ch,
+                    '`' | '"' | '\'' | ')' | ']' | '}' | '>' | '<' | ',' | ';' | ':'
+                )
+            {
+                end = idx + next_idx;
+                break;
+            }
+        }
+
+        let candidate = &message[*idx..end];
+        if let Some(path) = normalize_path_token_for_attachment(candidate) {
+            if seen.insert(path.clone()) {
+                results.push(path);
+            }
+        }
+    }
+
+    results
+}
+
+fn parse_outbound_image_attachments(message: &str) -> (String, Vec<PathBuf>) {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut attachments = Vec::new();
+    let mut cursor = 0;
+
+    while cursor < message.len() {
+        let Some(open_rel) = message[cursor..].find('[') else {
+            cleaned.push_str(&message[cursor..]);
+            break;
+        };
+
+        let open = cursor + open_rel;
+        cleaned.push_str(&message[cursor..open]);
+
+        let Some(close_rel) = message[open..].find(']') else {
+            cleaned.push_str(&message[open..]);
+            break;
+        };
+
+        let close = open + close_rel;
+        let marker = &message[open + 1..close];
+
+        let parsed = marker.split_once(':').and_then(|(kind, target)| {
+            if !kind.eq_ignore_ascii_case("image") {
+                return None;
+            }
+            normalize_path_token_for_attachment(target)
+        });
+
+        if let Some(path) = parsed {
+            attachments.push(path);
+        } else {
+            cleaned.push_str(&message[open..=close]);
+        }
+
+        cursor = close + 1;
+    }
+
+    // Also detect path-only outputs commonly returned by screenshot tasks.
+    let mut seen = HashSet::new();
+    for path in &attachments {
+        seen.insert(path.clone());
+    }
+    for token in message.split_whitespace() {
+        if let Some(path) = normalize_path_token_for_attachment(token) {
+            if seen.insert(path.clone()) {
+                attachments.push(path);
+            }
+        }
+    }
+    for path in extract_image_paths_by_scanning(message) {
+        if seen.insert(path.clone()) {
+            attachments.push(path);
+        }
+    }
+
+    let cleaned = cleaned.trim().to_string();
+    (cleaned, attachments)
+}
+
 fn pick_uniform_index(len: usize) -> usize {
     debug_assert!(len > 0);
     let upper = len as u64;
@@ -820,32 +1156,29 @@ impl Channel for DiscordChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let content = super::strip_tool_call_tags(&message.content);
+        let (text_without_markers, image_paths) = parse_outbound_image_attachments(&content);
+
+        if !image_paths.is_empty() {
+            let chunks = split_message_for_discord(&text_without_markers);
+            let first_chunk = chunks.first().cloned().unwrap_or_default();
+            self.send_message_with_image_attachments(
+                &message.recipient,
+                &first_chunk,
+                &image_paths,
+            )
+            .await?;
+
+            for chunk in chunks.iter().skip(1) {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                self.send_text_message(&message.recipient, chunk).await?;
+            }
+            return Ok(());
+        }
+
         let chunks = split_message_for_discord(&content);
 
         for (i, chunk) in chunks.iter().enumerate() {
-            let url = format!(
-                "https://discord.com/api/v10/channels/{}/messages",
-                message.recipient
-            );
-
-            let body = json!({ "content": chunk });
-
-            let resp = self
-                .http_client()
-                .post(&url)
-                .header("Authorization", format!("Bot {}", self.bot_token))
-                .json(&body)
-                .send()
-                .await?;
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let err = resp
-                    .text()
-                    .await
-                    .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-                anyhow::bail!("Discord send message failed ({status}): {err}");
-            }
+            self.send_text_message(&message.recipient, chunk).await?;
 
             // Add a small delay between chunks to avoid rate limiting
             if i < chunks.len() - 1 {
@@ -1445,6 +1778,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_application_command_interaction_extracts_skill_create_options() {
+        let payload = json!({
+            "id": "interaction-4",
+            "token": "interaction-token-4",
+            "type": 2,
+            "channel_id": "channel-4",
+            "data": {
+                "name": "skill",
+                "options": [
+                    {
+                        "type": 1,
+                        "name": "create",
+                        "options": [
+                            { "name": "name", "type": 3, "value": "browser-flow" },
+                            { "name": "prompt", "type": 3, "value": "Open page and verify title." }
+                        ]
+                    }
+                ]
+            },
+            "user": { "id": "user-4", "bot": false }
+        });
+
+        let parsed = parse_application_command_interaction(&payload).expect("should parse");
+        assert_eq!(parsed.command_name, "skill");
+        assert_eq!(parsed.subcommand_name(), Some("create"));
+        assert_eq!(parsed.option_value("name"), Some("browser-flow"));
+        assert_eq!(
+            parsed.option_value("prompt"),
+            Some("Open page and verify title.")
+        );
+    }
+
+    #[test]
     fn parse_application_command_interaction_legacy_skill_options_without_subcommand() {
         let payload = json!({
             "id": "interaction-3",
@@ -1488,6 +1854,7 @@ mod tests {
             .filter_map(|option| option.get("name").and_then(serde_json::Value::as_str))
             .collect();
         assert!(subcommands.contains(&DISCORD_SLASH_SKILL_SUBCOMMAND_RUN));
+        assert!(subcommands.contains(&DISCORD_SLASH_SKILL_SUBCOMMAND_CREATE));
         assert!(subcommands.contains(&DISCORD_SLASH_SKILL_SUBCOMMAND_INSTALL));
         assert!(subcommands.contains(&DISCORD_SLASH_SKILL_SUBCOMMAND_REMOVE));
     }
@@ -1891,6 +2258,40 @@ mod tests {
         for part in &parts {
             assert!(part.len() <= DISCORD_MAX_MESSAGE_LENGTH);
         }
+    }
+
+    #[test]
+    fn parse_outbound_image_attachments_extracts_image_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("shot.png");
+        std::fs::write(&image, b"fake").unwrap();
+        let message = format!("Done.\n[IMAGE:{}]", image.display());
+
+        let (cleaned, attachments) = parse_outbound_image_attachments(&message);
+        assert_eq!(cleaned, "Done.");
+        assert_eq!(attachments, vec![image]);
+    }
+
+    #[test]
+    fn parse_outbound_image_attachments_extracts_plain_path_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("snap.jpg");
+        std::fs::write(&image, b"fake").unwrap();
+        let message = format!("截图路径：`{}`", image.display());
+
+        let (_cleaned, attachments) = parse_outbound_image_attachments(&message);
+        assert_eq!(attachments, vec![image]);
+    }
+
+    #[test]
+    fn normalize_path_token_for_attachment_with_roots_resolves_relative_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("relative.png");
+        std::fs::write(&image, b"fake").unwrap();
+
+        let roots = vec![dir.path().to_path_buf()];
+        let resolved = normalize_path_token_for_attachment_with_roots("relative.png", &roots);
+        assert_eq!(resolved, Some(image));
     }
 
     // process_attachments tests

@@ -26,6 +26,7 @@ const STREAM_CHUNK_MIN_CHARS: usize = 80;
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
+const TOOL_EXHAUSTION_RECENT_CALLS_LIMIT: usize = 8;
 
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
@@ -1786,6 +1787,45 @@ pub(crate) fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ToolIterationLimitError {
+    pub max_iterations: usize,
+    pub last_tool_calls: Vec<String>,
+    pub finalize_attempted: bool,
+    pub finalize_error: Option<String>,
+}
+
+impl std::fmt::Display for ToolIterationLimitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Agent exceeded maximum tool iterations ({})",
+            self.max_iterations
+        )
+    }
+}
+
+impl std::error::Error for ToolIterationLimitError {}
+
+pub(crate) fn find_tool_iteration_limit_error(
+    err: &anyhow::Error,
+) -> Option<&ToolIterationLimitError> {
+    err.chain()
+        .find_map(|source| source.downcast_ref::<ToolIterationLimitError>())
+}
+
+fn record_recent_tool_call_name(recent: &mut Vec<String>, name: &str) {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    recent.push(trimmed.to_string());
+    while recent.len() > TOOL_EXHAUSTION_RECENT_CALLS_LIMIT {
+        recent.remove(0);
+    }
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
@@ -2024,6 +2064,7 @@ pub(crate) async fn run_tool_call_loop(
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
+    let mut recent_tool_call_names: Vec<String> = Vec::new();
 
     for iteration in 0..max_iterations {
         if cancellation_token
@@ -2305,6 +2346,10 @@ pub(crate) async fn run_tool_call_loop(
             }
             history.push(ChatMessage::assistant(response_text.clone()));
             return Ok(display_text);
+        }
+
+        for call in &tool_calls {
+            record_recent_tool_call_name(&mut recent_tool_call_names, &call.name);
         }
 
         // Print any text the LLM produced alongside tool calls (unless silent)
@@ -2609,9 +2654,123 @@ pub(crate) async fn run_tool_call_loop(
         Some("agent exceeded maximum tool iterations"),
         serde_json::json!({
             "max_iterations": max_iterations,
+            "last_tool_calls": recent_tool_call_names.clone(),
         }),
     );
-    anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+
+    let finalize_attempted = true;
+
+    let finalize_instruction = format!(
+        "[System notice]\nTool execution budget exhausted after {max_iterations} iterations.\n\
+You must now provide the best possible final answer WITHOUT any additional tool calls.\n\
+If the request asks for a complete list and you cannot guarantee completeness, clearly state:\n\
+1) what has been collected, 2) what is missing, 3) concrete next steps."
+    );
+    history.push(ChatMessage::user(finalize_instruction));
+
+    runtime_trace::record_event(
+        "tool_loop_finalize_attempt",
+        Some(channel_name),
+        Some(provider_name),
+        Some(model),
+        Some(&turn_id),
+        None,
+        None,
+        serde_json::json!({
+            "max_iterations": max_iterations,
+            "last_tool_calls": recent_tool_call_names.clone(),
+        }),
+    );
+
+    let finalize_error =
+        match multimodal::prepare_messages_for_provider(history, multimodal_config).await {
+            Ok(prepared_messages) => {
+                let finalize_chat_future = provider.chat(
+                    ChatRequest {
+                        messages: &prepared_messages.messages,
+                        tools: None,
+                    },
+                    model,
+                    temperature,
+                );
+
+                let finalize_chat_result = if let Some(token) = cancellation_token.as_ref() {
+                    tokio::select! {
+                        () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                        result = finalize_chat_future => result,
+                    }
+                } else {
+                    finalize_chat_future.await
+                };
+
+                match finalize_chat_result {
+                    Ok(response) => {
+                        let response_text = response.text_or_empty().to_string();
+                        let (parsed_text, parsed_tool_calls) = parse_tool_calls(&response_text);
+                        if !parsed_tool_calls.is_empty() {
+                            Some(format!(
+                                "finalize pass returned {} additional tool call(s)",
+                                parsed_tool_calls.len()
+                            ))
+                        } else {
+                            let finalized_display = if parsed_text.is_empty() {
+                                response_text.clone()
+                            } else {
+                                parsed_text
+                            };
+
+                            if finalized_display.trim().is_empty() {
+                                Some("finalize pass returned an empty answer".to_string())
+                            } else {
+                                runtime_trace::record_event(
+                                    "tool_loop_finalize_response",
+                                    Some(channel_name),
+                                    Some(provider_name),
+                                    Some(model),
+                                    Some(&turn_id),
+                                    Some(true),
+                                    None,
+                                    serde_json::json!({
+                                        "max_iterations": max_iterations,
+                                        "last_tool_calls": recent_tool_call_names.clone(),
+                                        "text": scrub_credentials(&finalized_display),
+                                    }),
+                                );
+                                history.push(ChatMessage::assistant(response_text));
+                                return Ok(finalized_display);
+                            }
+                        }
+                    }
+                    Err(err) => Some(providers::sanitize_api_error(&err.to_string())),
+                }
+            }
+            Err(err) => Some(providers::sanitize_api_error(&err.to_string())),
+        };
+
+    let finalize_message = finalize_error.as_deref();
+    runtime_trace::record_event(
+        "tool_loop_finalize_response",
+        Some(channel_name),
+        Some(provider_name),
+        Some(model),
+        Some(&turn_id),
+        Some(false),
+        finalize_message,
+        serde_json::json!({
+            "max_iterations": max_iterations,
+            "last_tool_calls": recent_tool_call_names.clone(),
+            "finalize_attempted": finalize_attempted,
+            "finalize_error": finalize_error.clone(),
+        }),
+    );
+
+    Err(ToolIterationLimitError {
+        max_iterations,
+        last_tool_calls: recent_tool_call_names,
+        finalize_attempted,
+        finalize_error,
+    }
+    .into())
 }
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -3922,6 +4081,120 @@ mod tests {
             .expect("prompt-mode tool result payload should be present");
         assert!(tool_results.content.contains("counted:A"));
         assert!(tool_results.content.contains("Skipped duplicate tool call"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_returns_finalize_response_after_iteration_exhaustion() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"B"}}
+</tool_call>"#,
+            "Final answer without more tools.",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("collect everything"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            2,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("finalize pass should produce a fallback final answer");
+
+        assert_eq!(result, "Final answer without more tools.");
+        assert_eq!(invocations.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_returns_structured_error_when_finalize_still_requests_tools() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"B"}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"C"}}
+</tool_call>"#,
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("collect everything"),
+        ];
+        let observer = NoopObserver;
+
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            2,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect_err("finalize pass should fail when provider still emits tool calls");
+
+        assert!(err
+            .to_string()
+            .contains("Agent exceeded maximum tool iterations (2)"));
+        let detail = find_tool_iteration_limit_error(&err)
+            .expect("structured tool-iteration detail should be available");
+        assert_eq!(detail.max_iterations, 2);
+        assert_eq!(
+            detail.last_tool_calls,
+            vec!["count_tool".to_string(), "count_tool".to_string()]
+        );
+        assert!(detail.finalize_attempted);
+        assert!(detail
+            .finalize_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("additional tool call"));
     }
 
     #[tokio::test]

@@ -145,6 +145,7 @@ Runtime in-chat commands (Telegram/Discord while channel server is running):
 - `/model`
 - `/model <model-id>`
 - `/skills` — list loaded skills for current runtime
+- `/skill create name:<skill-name> prompt:<instructions>` — create a new local skill from chat
 - `/skills install <source>` — install and audit a skill during runtime
 - `/skills remove <name>` — remove an installed skill during runtime
 - `/skill <name> [input]` — run a specific skill in current sender session
@@ -156,6 +157,7 @@ Discord note:
 - `/new` clears the current sender session history and starts a fresh context.
 - `/skill` uses subcommands:
   - `/skill run name:<skill> [input:<text>]`
+  - `/skill create name:<skill-name> prompt:<instructions>`
   - `/skill install source:<url-or-path>`
   - `/skill remove name:<skill>`
 

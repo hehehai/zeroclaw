@@ -65,7 +65,9 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
+use crate::agent::loop_::{
+    build_tool_instructions, find_tool_iteration_limit_error, run_tool_call_loop, scrub_credentials,
+};
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -76,7 +78,7 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -120,9 +122,24 @@ const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
 /// Guardrail for hook-modified outbound channel content.
 const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
+const CHANNEL_INFLIGHT_RECOVERY_FILE: &str = "state/channel-inflight-messages.json";
+const CHANNEL_INFLIGHT_RECOVERY_DELAY_SECS: u64 = 2;
+const CHANNEL_INFLIGHT_RECOVERY_PREVIEW_CHARS: usize = 240;
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct InFlightChannelMessageRecord {
+    key: String,
+    channel: String,
+    sender: String,
+    reply_target: String,
+    message_id: String,
+    content_preview: String,
+    thread_ts: Option<String>,
+    started_at_unix_secs: u64,
+}
 
 fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
     configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
@@ -152,6 +169,7 @@ enum ChannelRuntimeCommand {
     ShowSkills,
     InstallSkill { source: String },
     RemoveSkill { name: String },
+    CreateSkill { name: String, prompt: String },
     RunSkill { name: String, input: String },
     ResetSession,
 }
@@ -271,6 +289,191 @@ fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
 
 fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
+}
+
+fn channel_inflight_recovery_path(workspace_dir: &Path) -> PathBuf {
+    workspace_dir.join(CHANNEL_INFLIGHT_RECOVERY_FILE)
+}
+
+fn channel_inflight_file_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn load_inflight_channel_records(path: &Path) -> Vec<InFlightChannelMessageRecord> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+
+    serde_json::from_str::<Vec<InFlightChannelMessageRecord>>(&raw).unwrap_or_default()
+}
+
+fn save_inflight_channel_records(path: &Path, records: &[InFlightChannelMessageRecord]) {
+    if records.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+
+    if let Some(parent) = path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                "failed to create in-flight recovery directory {}: {err}",
+                parent.display()
+            );
+            return;
+        }
+    }
+
+    match serde_json::to_string_pretty(records) {
+        Ok(serialized) => {
+            if let Err(err) = std::fs::write(path, serialized) {
+                tracing::warn!(
+                    "failed to persist in-flight channel records {}: {err}",
+                    path.display()
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!("failed to serialize in-flight channel records: {err}");
+        }
+    }
+}
+
+fn inflight_channel_record_key(msg: &traits::ChannelMessage) -> String {
+    format!("{}::{}::{}", msg.channel, msg.reply_target, msg.id)
+}
+
+fn mark_inflight_channel_message(workspace_dir: &Path, msg: &traits::ChannelMessage) -> String {
+    let key = inflight_channel_record_key(msg);
+    let record = InFlightChannelMessageRecord {
+        key: key.clone(),
+        channel: msg.channel.clone(),
+        sender: msg.sender.clone(),
+        reply_target: msg.reply_target.clone(),
+        message_id: msg.id.clone(),
+        content_preview: truncate_with_ellipsis(
+            &msg.content,
+            CHANNEL_INFLIGHT_RECOVERY_PREVIEW_CHARS,
+        ),
+        thread_ts: msg.thread_ts.clone(),
+        started_at_unix_secs: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+
+    let path = channel_inflight_recovery_path(workspace_dir);
+    let _lock = channel_inflight_file_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut records = load_inflight_channel_records(&path);
+    records.retain(|existing| existing.key != key);
+    records.push(record);
+    save_inflight_channel_records(&path, &records);
+
+    key
+}
+
+fn clear_inflight_channel_message(workspace_dir: &Path, record_key: &str) {
+    let path = channel_inflight_recovery_path(workspace_dir);
+    let _lock = channel_inflight_file_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut records = load_inflight_channel_records(&path);
+    let before = records.len();
+    records.retain(|existing| existing.key != record_key);
+    if records.len() != before {
+        save_inflight_channel_records(&path, &records);
+    }
+}
+
+struct InFlightChannelMessageGuard {
+    workspace_dir: Arc<PathBuf>,
+    record_key: String,
+}
+
+impl InFlightChannelMessageGuard {
+    fn track(workspace_dir: Arc<PathBuf>, msg: &traits::ChannelMessage) -> Self {
+        let record_key = mark_inflight_channel_message(workspace_dir.as_path(), msg);
+        Self {
+            workspace_dir,
+            record_key,
+        }
+    }
+}
+
+impl Drop for InFlightChannelMessageGuard {
+    fn drop(&mut self) {
+        clear_inflight_channel_message(self.workspace_dir.as_path(), &self.record_key);
+    }
+}
+
+async fn notify_interrupted_channel_messages(ctx: Arc<ChannelRuntimeContext>) {
+    let path = channel_inflight_recovery_path(ctx.workspace_dir.as_path());
+    let pending_records = {
+        let _lock = channel_inflight_file_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        load_inflight_channel_records(&path)
+    };
+
+    if pending_records.is_empty() {
+        return;
+    }
+
+    tracing::warn!(
+        "detected {} in-flight channel message(s) left by previous process; attempting recovery notices",
+        pending_records.len()
+    );
+
+    let mut delivered_keys = HashSet::new();
+    for record in pending_records {
+        let Some(channel) = ctx.channels_by_name.get(&record.channel).cloned() else {
+            tracing::warn!(
+                channel = %record.channel,
+                message_id = %record.message_id,
+                "skipping interrupted-message notice because channel is unavailable"
+            );
+            continue;
+        };
+
+        let notice = format!(
+            "⚠️ 检测到你上一条请求在服务重启时被中断，未能返回结果。\n\
+- 原消息: `{}`\n\
+- 消息ID: `{}`\n\
+- 中断时间(Unix): `{}`\n\n\
+请直接重发这条请求，我会继续处理。",
+            record.content_preview, record.message_id, record.started_at_unix_secs
+        );
+
+        let send_result = channel
+            .send(
+                &SendMessage::new(notice, &record.reply_target).in_thread(record.thread_ts.clone()),
+            )
+            .await;
+
+        if let Err(err) = send_result {
+            tracing::warn!(
+                channel = %record.channel,
+                message_id = %record.message_id,
+                "failed to send interrupted-message notice: {err}"
+            );
+            continue;
+        }
+
+        delivered_keys.insert(record.key);
+    }
+
+    if delivered_keys.is_empty() {
+        return;
+    }
+
+    let _lock = channel_inflight_file_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut records = load_inflight_channel_records(&path);
+    records.retain(|record| !delivered_keys.contains(&record.key));
+    save_inflight_channel_records(&path, &records);
 }
 
 /// Strip tool-call XML tags from outgoing messages.
@@ -504,6 +707,11 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 let name = parts.collect::<Vec<_>>().join(" ").trim().to_string();
                 Some(ChannelRuntimeCommand::RemoveSkill { name })
             }
+            Some(subcommand) if subcommand == "create" => {
+                let remainder = parts.collect::<Vec<_>>().join(" ").trim().to_string();
+                let (name, prompt) = parse_skill_create_command_args(&remainder);
+                Some(ChannelRuntimeCommand::CreateSkill { name, prompt })
+            }
             _ => Some(ChannelRuntimeCommand::ShowSkills),
         },
         "/skill" => {
@@ -514,6 +722,9 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::InstallSkill { source: remainder })
             } else if first_lower == "remove" {
                 Some(ChannelRuntimeCommand::RemoveSkill { name: remainder })
+            } else if first_lower == "create" {
+                let (name, prompt) = parse_skill_create_command_args(&remainder);
+                Some(ChannelRuntimeCommand::CreateSkill { name, prompt })
             } else {
                 Some(ChannelRuntimeCommand::RunSkill {
                     name: first,
@@ -851,6 +1062,61 @@ fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     .any(|hint| lower.contains(hint))
 }
 
+fn format_tool_iteration_limit_diagnostic(
+    err: &anyhow::Error,
+    detail: &crate::agent::loop_::ToolIterationLimitError,
+    route: &ChannelRouteSelection,
+    elapsed_ms: u128,
+) -> String {
+    let safe_error = providers::sanitize_api_error(&err.to_string());
+    let last_tool_calls = if detail.last_tool_calls.is_empty() {
+        "<none>".to_string()
+    } else {
+        detail
+            .last_tool_calls
+            .iter()
+            .map(|name| format!("`{}`", name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let finalize_status = if detail.finalize_attempted {
+        if let Some(finalize_error) = detail.finalize_error.as_deref() {
+            format!(
+                "attempted but failed (`{}`)",
+                providers::sanitize_api_error(finalize_error)
+            )
+        } else {
+            "attempted".to_string()
+        }
+    } else {
+        "not attempted".to_string()
+    };
+
+    format!(
+        "⚠️ Request failed (`tool_iterations_exhausted`)\n\n\
+- provider: `{}`\n\
+- model: `{}`\n\
+- max_tool_iterations: `{}`\n\
+- elapsed_ms: `{}`\n\
+- last_tool_calls: {}\n\
+- finalize_after_exhaustion: {}\n\
+- error: `{}`\n\n\
+排查建议:\n\
+1) 先使用 `/new` 重置会话后重试\n\
+2) 将“全部列表”拆分成分段请求（如按时间/页码）\n\
+3) 如需完整抓取，提升 `agent.max_tool_iterations`（建议 30 或 40）\n\
+4) 查看追踪：`zeroclaw doctor traces --event tool_loop_exhausted --limit 20`（若无输出，先启用 `observability.runtime_trace_mode = \"rolling\"`）",
+        route.provider,
+        route.model,
+        detail.max_iterations,
+        elapsed_ms,
+        last_tool_calls,
+        finalize_status,
+        safe_error
+    )
+}
+
 fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<String> {
     let cache_path = workspace_dir.join("state").join(MODEL_CACHE_FILE);
     let Ok(raw) = std::fs::read_to_string(cache_path) else {
@@ -1008,7 +1274,7 @@ fn build_skills_help_response(workspace_dir: &Path) -> String {
     let skills = load_runtime_skills(workspace_dir);
 
     if skills.is_empty() {
-        return "No skills are currently loaded.\nInstall one with `/skills install <source>` (or `zeroclaw skills install <source>`).\nUse `/skill <name> [input]` once skills are available.".to_string();
+        return "No skills are currently loaded.\nCreate one with `/skill create name:<skill-name> prompt:<instructions>`.\nInstall one with `/skills install <source>` (or `zeroclaw skills install <source>`).\nUse `/skill <name> [input]` once skills are available.".to_string();
     }
 
     let mut response = String::new();
@@ -1026,7 +1292,7 @@ fn build_skills_help_response(workspace_dir: &Path) -> String {
         }
     }
     response.push_str(
-        "\nRun a skill with `/skill <name> [input]`.\nInstall with `/skills install <source>`.\nRemove with `/skills remove <name>`.",
+        "\nRun a skill with `/skill <name> [input]`.\nCreate with `/skill create name:<skill-name> prompt:<instructions>`.\nInstall with `/skills install <source>`.\nRemove with `/skills remove <name>`.",
     );
     response
 }
@@ -1078,6 +1344,49 @@ fn available_skill_names_csv(workspace_dir: &Path) -> String {
     } else {
         names.join(", ")
     }
+}
+
+fn parse_skill_create_command_args(raw: &str) -> (String, String) {
+    let mut name_tokens = Vec::new();
+    let mut prompt_tokens = Vec::new();
+    let mut collecting_name = false;
+    let mut collecting_prompt = false;
+
+    for token in raw.split_whitespace() {
+        let lowered = token.to_ascii_lowercase();
+
+        if collecting_prompt {
+            prompt_tokens.push(token.to_string());
+            continue;
+        }
+
+        if lowered.starts_with("prompt:") {
+            collecting_prompt = true;
+            collecting_name = false;
+            let value = token.get("prompt:".len()..).unwrap_or_default();
+            if !value.is_empty() {
+                prompt_tokens.push(value.to_string());
+            }
+            continue;
+        }
+
+        if lowered.starts_with("name:") {
+            collecting_name = true;
+            let value = token.get("name:".len()..).unwrap_or_default();
+            if !value.is_empty() {
+                name_tokens.push(value.to_string());
+            }
+            continue;
+        }
+
+        if collecting_name {
+            name_tokens.push(token.to_string());
+        }
+    }
+
+    let name = name_tokens.join(" ").trim().to_string();
+    let prompt = prompt_tokens.join(" ").trim().to_string();
+    (name, prompt)
 }
 
 fn build_skill_execution_prompt(name: &str, input: &str) -> String {
@@ -1206,6 +1515,38 @@ async fn handle_runtime_command_if_needed(
                         format!("Skill remove failed.\nDetails: {safe_err}")
                     }
                     Err(err) => format!("Skill remove task failed to run: {err}"),
+                }
+            }
+        }
+        ChannelRuntimeCommand::CreateSkill { name, prompt } => {
+            let name = name.trim().to_string();
+            let prompt = prompt.trim().to_string();
+            if name.is_empty() || prompt.is_empty() {
+                "Missing required fields.\nUsage: `/skill create name:<skill-name> prompt:<instructions>`"
+                    .to_string()
+            } else {
+                let workspace_dir = Arc::clone(&ctx.workspace_dir);
+                match tokio::task::spawn_blocking(move || {
+                    crate::skills::create_skill_from_prompt(&name, &prompt, workspace_dir.as_path())
+                })
+                .await
+                {
+                    Ok(Ok(skill_file)) => {
+                        let skill_name = skill_file
+                            .parent()
+                            .and_then(std::path::Path::file_name)
+                            .and_then(std::ffi::OsStr::to_str)
+                            .unwrap_or("unknown");
+                        format!(
+                            "Skill `{skill_name}` created at `{}`.\nUse `/skills` to list installed skills.\nRun with `/skill {skill_name} [input]`.",
+                            skill_file.display()
+                        )
+                    }
+                    Ok(Err(err)) => {
+                        let safe_err = providers::sanitize_api_error(&err.to_string());
+                        format!("Skill create failed.\nDetails: {safe_err}")
+                    }
+                    Err(err) => format!("Skill create task failed to run: {err}"),
                 }
             }
         }
@@ -1678,6 +2019,63 @@ fn spawn_scoped_typing_task(
     handle
 }
 
+async fn apply_outbound_hooks_if_needed(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    outbound_response: String,
+) -> Option<String> {
+    if let Some(hooks) = &ctx.hooks {
+        match hooks
+            .run_on_message_sending(
+                msg.channel.clone(),
+                msg.reply_target.clone(),
+                outbound_response.clone(),
+            )
+            .await
+        {
+            crate::hooks::HookResult::Cancel(reason) => {
+                tracing::info!(%reason, "outgoing message suppressed by hook");
+                return None;
+            }
+            crate::hooks::HookResult::Continue((hook_channel, hook_recipient, mut modified)) => {
+                if hook_channel != msg.channel || hook_recipient != msg.reply_target {
+                    tracing::warn!(
+                        from_channel = %msg.channel,
+                        from_recipient = %msg.reply_target,
+                        to_channel = %hook_channel,
+                        to_recipient = %hook_recipient,
+                        "on_message_sending attempted to rewrite channel routing; only content mutation is applied"
+                    );
+                }
+
+                let modified_len = modified.chars().count();
+                if modified_len > CHANNEL_HOOK_MAX_OUTBOUND_CHARS {
+                    tracing::warn!(
+                        limit = CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
+                        attempted = modified_len,
+                        "hook-modified outbound content exceeded limit; truncating"
+                    );
+                    modified = truncate_with_ellipsis(&modified, CHANNEL_HOOK_MAX_OUTBOUND_CHARS);
+                }
+
+                if modified != outbound_response {
+                    tracing::info!(
+                        channel = %msg.channel,
+                        sender = %msg.sender,
+                        before_len = outbound_response.chars().count(),
+                        after_len = modified.chars().count(),
+                        "outgoing message content modified by hook"
+                    );
+                }
+
+                Some(modified)
+            }
+        }
+    } else {
+        Some(outbound_response)
+    }
+}
+
 async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: traits::ChannelMessage,
@@ -1729,6 +2127,7 @@ async fn process_channel_message(
     if handle_runtime_command_if_needed(ctx.as_ref(), &mut msg, target_channel.as_ref()).await {
         return;
     }
+    let _inflight_guard = InFlightChannelMessageGuard::track(Arc::clone(&ctx.workspace_dir), &msg);
 
     let history_key = conversation_history_key(&msg);
     let route = get_route_selection(ctx.as_ref(), &history_key);
@@ -1941,7 +2340,7 @@ async fn process_channel_message(
         log_worker_join_result(handle.await);
     }
 
-    let reaction_done_emoji = match &llm_result {
+    let mut reaction_done_emoji = match &llm_result {
         LlmExecutionResult::Completed(Ok(Ok(_))) => "\u{2705}", // ✅
         _ => "\u{26A0}\u{FE0F}",                                // ⚠️
     };
@@ -1975,63 +2374,11 @@ async fn process_channel_message(
             }
         }
         LlmExecutionResult::Completed(Ok(Ok(response))) => {
-            // ── Hook: on_message_sending (modifying) ─────────
-            let mut outbound_response = response;
-            if let Some(hooks) = &ctx.hooks {
-                match hooks
-                    .run_on_message_sending(
-                        msg.channel.clone(),
-                        msg.reply_target.clone(),
-                        outbound_response.clone(),
-                    )
-                    .await
-                {
-                    crate::hooks::HookResult::Cancel(reason) => {
-                        tracing::info!(%reason, "outgoing message suppressed by hook");
-                        return;
-                    }
-                    crate::hooks::HookResult::Continue((
-                        hook_channel,
-                        hook_recipient,
-                        mut modified_content,
-                    )) => {
-                        if hook_channel != msg.channel || hook_recipient != msg.reply_target {
-                            tracing::warn!(
-                                from_channel = %msg.channel,
-                                from_recipient = %msg.reply_target,
-                                to_channel = %hook_channel,
-                                to_recipient = %hook_recipient,
-                                "on_message_sending attempted to rewrite channel routing; only content mutation is applied"
-                            );
-                        }
-
-                        let modified_len = modified_content.chars().count();
-                        if modified_len > CHANNEL_HOOK_MAX_OUTBOUND_CHARS {
-                            tracing::warn!(
-                                limit = CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
-                                attempted = modified_len,
-                                "hook-modified outbound content exceeded limit; truncating"
-                            );
-                            modified_content = truncate_with_ellipsis(
-                                &modified_content,
-                                CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
-                            );
-                        }
-
-                        if modified_content != outbound_response {
-                            tracing::info!(
-                                channel = %msg.channel,
-                                sender = %msg.sender,
-                                before_len = outbound_response.chars().count(),
-                                after_len = modified_content.chars().count(),
-                                "outgoing message content modified by hook"
-                            );
-                        }
-
-                        outbound_response = modified_content;
-                    }
-                }
-            }
+            let Some(outbound_response) =
+                apply_outbound_hooks_if_needed(ctx.as_ref(), &msg, response).await
+            else {
+                return;
+            };
 
             let sanitized_response =
                 sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
@@ -2132,11 +2479,6 @@ async fn process_channel_message(
                 }
             } else if is_context_window_overflow_error(&e) {
                 let compacted = compact_sender_history(ctx.as_ref(), &history_key);
-                let error_text = if compacted {
-                    "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
-                } else {
-                    "⚠️ Context window exceeded for this conversation. Please resend your last message."
-                };
                 eprintln!(
                     "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
                     started_at.elapsed().as_millis(),
@@ -2156,18 +2498,214 @@ async fn process_channel_message(
                         "history_compacted": compacted,
                     }),
                 );
-                if let Some(channel) = target_channel.as_ref() {
-                    if let Some(ref draft_id) = draft_message_id {
-                        let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, error_text)
-                            .await;
+                let mut retried_successfully = false;
+                if compacted && !cancellation_token.is_cancelled() {
+                    eprintln!("  🔁 Retrying once after context compaction...");
+                    let retry_prior_turns_raw = ctx
+                        .conversation_histories
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get(&history_key)
+                        .cloned()
+                        .unwrap_or_default();
+                    let retry_prior_turns = normalize_cached_channel_turns(retry_prior_turns_raw);
+                    let retry_system_prompt =
+                        build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel);
+                    let mut retry_history = vec![ChatMessage::system(retry_system_prompt)];
+                    retry_history.extend(retry_prior_turns);
+                    let retry_history_len_before_tools = retry_history.len();
+
+                    let retry_result = tokio::time::timeout(
+                        Duration::from_secs(timeout_budget_secs),
+                        run_tool_call_loop(
+                            active_provider.as_ref(),
+                            &mut retry_history,
+                            ctx.tools_registry.as_ref(),
+                            ctx.observer.as_ref(),
+                            route.provider.as_str(),
+                            route.model.as_str(),
+                            runtime_defaults.temperature,
+                            true,
+                            None,
+                            msg.channel.as_str(),
+                            &ctx.multimodal,
+                            ctx.max_tool_iterations,
+                            Some(cancellation_token.clone()),
+                            None,
+                            ctx.hooks.as_deref(),
+                            if msg.channel == "cli" {
+                                &[]
+                            } else {
+                                ctx.non_cli_excluded_tools.as_ref()
+                            },
+                        ),
+                    )
+                    .await;
+
+                    match retry_result {
+                        Ok(Ok(retry_response)) => {
+                            let Some(outbound_response) =
+                                apply_outbound_hooks_if_needed(ctx.as_ref(), &msg, retry_response)
+                                    .await
+                            else {
+                                return;
+                            };
+
+                            let sanitized_response = sanitize_channel_response(
+                                &outbound_response,
+                                ctx.tools_registry.as_ref(),
+                            );
+                            let delivered_response = if sanitized_response.is_empty()
+                                && !outbound_response.trim().is_empty()
+                            {
+                                "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
+                            } else {
+                                sanitized_response
+                            };
+
+                            runtime_trace::record_event(
+                                "channel_message_outbound",
+                                Some(msg.channel.as_str()),
+                                Some(route.provider.as_str()),
+                                Some(route.model.as_str()),
+                                None,
+                                Some(true),
+                                None,
+                                serde_json::json!({
+                                    "sender": msg.sender,
+                                    "elapsed_ms": started_at.elapsed().as_millis(),
+                                    "response": scrub_credentials(&delivered_response),
+                                    "retry_after_compaction": true,
+                                }),
+                            );
+
+                            let tool_summary = extract_tool_context_summary(
+                                &retry_history,
+                                retry_history_len_before_tools,
+                            );
+                            let history_response =
+                                if tool_summary.is_empty() || msg.channel == "telegram" {
+                                    delivered_response.clone()
+                                } else {
+                                    format!("{tool_summary}\n{delivered_response}")
+                                };
+
+                            append_sender_turn(
+                                ctx.as_ref(),
+                                &history_key,
+                                ChatMessage::assistant(&history_response),
+                            );
+                            println!(
+                                "  🤖 Reply ({}ms, retried after compaction): {}",
+                                started_at.elapsed().as_millis(),
+                                truncate_with_ellipsis(&delivered_response, 80)
+                            );
+
+                            if let Some(channel) = target_channel.as_ref() {
+                                if let Some(ref draft_id) = draft_message_id {
+                                    if let Err(send_err) = channel
+                                        .finalize_draft(
+                                            &msg.reply_target,
+                                            draft_id,
+                                            &delivered_response,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            "Failed to finalize draft after retry: {send_err}; sending as new message"
+                                        );
+                                        let _ = channel
+                                            .send(
+                                                &SendMessage::new(
+                                                    &delivered_response,
+                                                    &msg.reply_target,
+                                                )
+                                                .in_thread(msg.thread_ts.clone()),
+                                            )
+                                            .await;
+                                    }
+                                } else if let Err(send_err) = channel
+                                    .send(
+                                        &SendMessage::new(delivered_response, &msg.reply_target)
+                                            .in_thread(msg.thread_ts.clone()),
+                                    )
+                                    .await
+                                {
+                                    eprintln!(
+                                        "  ❌ Failed to reply after compaction retry on {}: {send_err}",
+                                        channel.name()
+                                    );
+                                }
+                            }
+
+                            retried_successfully = true;
+                            reaction_done_emoji = "\u{2705}";
+                        }
+                        Ok(Err(retry_err)) => {
+                            eprintln!(
+                                "  ❌ Auto-retry after context compaction failed: {retry_err}"
+                            );
+                            runtime_trace::record_event(
+                                "channel_message_error",
+                                Some(msg.channel.as_str()),
+                                Some(route.provider.as_str()),
+                                Some(route.model.as_str()),
+                                None,
+                                Some(false),
+                                Some("context window exceeded (auto retry failed)"),
+                                serde_json::json!({
+                                    "sender": msg.sender,
+                                    "elapsed_ms": started_at.elapsed().as_millis(),
+                                    "history_compacted": compacted,
+                                    "retry_attempted": true,
+                                    "retry_error": providers::sanitize_api_error(&retry_err.to_string()),
+                                }),
+                            );
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "  ❌ Auto-retry after context compaction timed out after {}s",
+                                timeout_budget_secs
+                            );
+                            runtime_trace::record_event(
+                                "channel_message_error",
+                                Some(msg.channel.as_str()),
+                                Some(route.provider.as_str()),
+                                Some(route.model.as_str()),
+                                None,
+                                Some(false),
+                                Some("context window exceeded (auto retry timed out)"),
+                                serde_json::json!({
+                                    "sender": msg.sender,
+                                    "elapsed_ms": started_at.elapsed().as_millis(),
+                                    "history_compacted": compacted,
+                                    "retry_attempted": true,
+                                    "retry_timeout_secs": timeout_budget_secs,
+                                }),
+                            );
+                        }
+                    }
+                }
+
+                if !retried_successfully {
+                    let error_text = if compacted {
+                        "⚠️ Context window exceeded for this conversation. I compacted recent history and retried once, but still could not complete this request. Please resend your last message."
                     } else {
-                        let _ = channel
-                            .send(
-                                &SendMessage::new(error_text, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
-                            .await;
+                        "⚠️ Context window exceeded for this conversation. Please resend your last message."
+                    };
+                    if let Some(channel) = target_channel.as_ref() {
+                        if let Some(ref draft_id) = draft_message_id {
+                            let _ = channel
+                                .finalize_draft(&msg.reply_target, draft_id, error_text)
+                                .await;
+                        } else {
+                            let _ = channel
+                                .send(
+                                    &SendMessage::new(error_text, &msg.reply_target)
+                                        .in_thread(msg.thread_ts.clone()),
+                                )
+                                .await;
+                        }
                     }
                 }
             } else {
@@ -2176,6 +2714,7 @@ async fn process_channel_message(
                     started_at.elapsed().as_millis()
                 );
                 let safe_error = providers::sanitize_api_error(&e.to_string());
+                let tool_iteration_error = find_tool_iteration_limit_error(&e);
                 runtime_trace::record_event(
                     "channel_message_error",
                     Some(msg.channel.as_str()),
@@ -2187,6 +2726,21 @@ async fn process_channel_message(
                     serde_json::json!({
                         "sender": msg.sender,
                         "elapsed_ms": started_at.elapsed().as_millis(),
+                        "error_code": if tool_iteration_error.is_some() {
+                            "tool_iterations_exhausted"
+                        } else {
+                            "llm_error"
+                        },
+                        "max_tool_iterations": tool_iteration_error
+                            .map(|detail| detail.max_iterations),
+                        "last_tool_calls": tool_iteration_error
+                            .map(|detail| detail.last_tool_calls.clone())
+                            .unwrap_or_default(),
+                        "finalize_attempted": tool_iteration_error
+                            .map(|detail| detail.finalize_attempted)
+                            .unwrap_or(false),
+                        "finalize_error": tool_iteration_error
+                            .and_then(|detail| detail.finalize_error.clone()),
                     }),
                 );
                 let should_rollback_user_turn = e
@@ -2204,15 +2758,21 @@ async fn process_channel_message(
                         ChatMessage::assistant("[Task failed — not continuing this request]"),
                     );
                 }
+                let elapsed_ms = started_at.elapsed().as_millis();
+                let user_visible_error = if let Some(detail) = tool_iteration_error {
+                    format_tool_iteration_limit_diagnostic(&e, detail, &route, elapsed_ms)
+                } else {
+                    format!("⚠️ Error: {e}")
+                };
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
+                            .finalize_draft(&msg.reply_target, draft_id, &user_visible_error)
                             .await;
                     } else {
                         let _ = channel
                             .send(
-                                &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
+                                &SendMessage::new(user_visible_error, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
                             .await;
@@ -3483,6 +4043,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
     });
 
+    {
+        let recovery_ctx = Arc::clone(&runtime_ctx);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(CHANNEL_INFLIGHT_RECOVERY_DELAY_SECS)).await;
+            notify_interrupted_channel_messages(recovery_ctx).await;
+        });
+    }
+
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
 
     // Wait for all channel tasks
@@ -3809,6 +4377,95 @@ mod tests {
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].content, "first");
         assert_eq!(turns[1].content, "ok");
+    }
+
+    #[test]
+    fn inflight_channel_record_roundtrip_mark_and_clear() {
+        let workspace = TempDir::new().expect("workspace temp dir");
+        let msg = traits::ChannelMessage {
+            id: "msg-1".to_string(),
+            sender: "zeroclaw_user".to_string(),
+            reply_target: "chat-1".to_string(),
+            content: "请抓取 hehehai.cn 的文章列表".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: Some("thread-1".to_string()),
+        };
+
+        let record_key = mark_inflight_channel_message(workspace.path(), &msg);
+        let path = channel_inflight_recovery_path(workspace.path());
+        let records = load_inflight_channel_records(&path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].key, record_key);
+        assert_eq!(records[0].channel, msg.channel);
+        assert_eq!(records[0].reply_target, msg.reply_target);
+        assert!(path.exists());
+
+        clear_inflight_channel_message(workspace.path(), &record_key);
+        let records_after_clear = load_inflight_channel_records(&path);
+        assert!(records_after_clear.is_empty());
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn notify_interrupted_messages_sends_notice_and_clears_records() {
+        let workspace = TempDir::new().expect("workspace temp dir");
+        let msg = traits::ChannelMessage {
+            id: "msg-2".to_string(),
+            sender: "zeroclaw_user".to_string(),
+            reply_target: "chat-2".to_string(),
+            content: "把网站文章都列出来".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 2,
+            thread_ts: Some("thread-2".to_string()),
+        };
+        let _ = mark_inflight_channel_message(workspace.path(), &msg);
+
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("dummy".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace.path().to_path_buf()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        notify_interrupted_channel_messages(Arc::clone(&ctx)).await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1, "recovery notice should be sent once");
+        assert!(sent[0].contains("服务重启时被中断"));
+        assert!(sent[0].contains("msg-2"));
+        drop(sent);
+
+        let path = channel_inflight_recovery_path(workspace.path());
+        let remaining_records = load_inflight_channel_records(&path);
+        assert!(remaining_records.is_empty());
+        assert!(!path.exists());
     }
 
     struct DummyProvider;
@@ -4931,6 +5588,212 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn process_channel_message_skill_create_command_creates_skill() {
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace.path().to_path_buf()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-skill-create-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/skill create name:browser-flow prompt:Open a page and verify the title."
+                    .to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Skill `browser-flow` created"));
+        assert!(workspace
+            .path()
+            .join("skills")
+            .join("browser-flow")
+            .join("SKILL.md")
+            .exists());
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_skill_create_command_rejects_missing_fields() {
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace.path().to_path_buf()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-skill-create-2".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/skill create name:browser-flow".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Missing required fields."));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_skill_create_command_rejects_existing_skill() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let skill_dir = workspace.path().join("skills").join("browser-flow");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# browser-flow").unwrap();
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace.path().to_path_buf()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-skill-create-3".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/skill create name:browser-flow prompt:Open and validate.".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Skill create failed."));
+        assert!(sent[0].contains("Skill already exists"));
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn process_channel_message_skill_remove_command_accepts_clawhub_url() {
         let workspace = tempfile::TempDir::new().unwrap();
         let skill_dir = workspace.path().join("skills").join("gog");
@@ -5468,7 +6331,9 @@ BTC is currently around $65,000 based on latest tool output."#
         let sent_messages = channel_impl.sent_messages.lock().await;
         assert_eq!(sent_messages.len(), 1);
         assert!(sent_messages[0].starts_with("chat-iter-fail:"));
-        assert!(sent_messages[0].contains("⚠️ Error: Agent exceeded maximum tool iterations (3)"));
+        assert!(sent_messages[0].contains("tool_iterations_exhausted"));
+        assert!(sent_messages[0].contains("max_tool_iterations: `3`"));
+        assert!(sent_messages[0].contains("last_tool_calls: `mock_price`"));
     }
 
     struct NoopMemory;

@@ -46,6 +46,7 @@ When running `zeroclaw channel start` (or daemon mode), Telegram and Discord sup
 - `/model` — show current model and cached model IDs (if available)
 - `/model <model-id>` — switch model for the current sender session
 - `/skills` — list loaded runtime skills
+- `/skill create name:<skill-name> prompt:<instructions>` — create a local skill from a prompt
 - `/skill <name> [input]` — run a specific skill in current sender session
 
 Notes:
@@ -53,7 +54,8 @@ Notes:
 - Switching clears only that sender's in-memory conversation history to avoid cross-model context contamination.
 - Model cache previews come from `zeroclaw models refresh --provider <ID>`.
 - These are runtime chat commands, not CLI subcommands.
-- Discord slash auto-registration includes `/new`, `/skills`, and `/skill` when `channels_config.discord.guild_id` is configured.
+- Skill creation rejects existing names by default (no overwrite); choose a different name to create another skill.
+- Discord slash auto-registration includes `/new`, `/skills`, and `/skill` when `channels_config.discord.guild_id` is configured; `/skill` includes `run`, `create`, `install`, and `remove`.
 
 ## Inbound Image Marker Protocol
 
